@@ -14,7 +14,15 @@ from contextlib import suppress
 from typing import BinaryIO, TextIO
 
 from .clients import InputClient, PanelClient
-from .supervisor import CHUNK_SIZE, Ports, Stream, Supervisor
+from .supervisor import CHUNK_SIZE, Ports, Stream, Supervisor, _InputLines
+
+_ECHO_CONTROLS = dict.fromkeys(
+    code for code in (*range(32), *range(127, 160)) if code not in (9, 10)
+)
+
+
+def _visible_input(text: str) -> str:
+    return text.translate(_ECHO_CONTROLS)
 
 
 class ConsoleInterrupt:
@@ -85,7 +93,7 @@ class _Transcoder:
 
 
 def _start_local_input(
-    supervisor: Supervisor, close_on_eof: bool, encoding: str,
+    supervisor: Supervisor, close_on_eof: bool, encoding: str, output: ConsoleOutput | None = None,
 ) -> threading.Event:
     loop = asyncio.get_running_loop()
     stopped = threading.Event()
@@ -95,10 +103,20 @@ def _start_local_input(
     raw = getattr(binary, "raw", binary)
     terminal_encoding = _terminal_encoding(sys.stdin, raw)
     transcoder = _Transcoder(terminal_encoding, encoding) if terminal_encoding else None
+    echo_decoder = (
+        codecs.getincrementaldecoder(encoding)("replace")
+        if terminal_encoding is None and output is not None else None
+    )
+    lines = _InputLines()
 
     async def forward(data: bytes, eof: bool) -> None:
-        if data:
-            await supervisor.send(data)
+        if echo_decoder is not None and output is not None:
+            await output.echo_input(echo_decoder.decode(data, final=eof))
+        for line in lines.feed(data):
+            if transcoder is not None:
+                line = transcoder.convert(line)
+            if line:
+                await supervisor.send(line)
         if eof and close_on_eof:
             await supervisor.close_stdin()
 
@@ -109,9 +127,7 @@ def _start_local_input(
                 if stopped.is_set() or data is None:
                     return
                 eof = not data
-                if transcoder is not None:
-                    data = transcoder.convert(data, final=eof)
-                if data or (eof and close_on_eof):
+                if data or (eof and (close_on_eof or echo_decoder is not None)):
                     operation = forward(data, eof)
                     try:
                         future = asyncio.run_coroutine_threadsafe(operation, loop)
@@ -121,6 +137,9 @@ def _start_local_input(
                     future.result()
                 if eof:
                     return
+            except ValueError as error:
+                print(f"side-cli: {error}", file=sys.stderr)
+                return
             except (OSError, RuntimeError, CancelledError):
                 return
 
@@ -132,6 +151,8 @@ class ConsoleOutput:
     def __init__(self, encoding: str) -> None:
         self.sinks = {}
         self.transcoders: dict[Stream, _Transcoder] = {}
+        self._stdout_lock = asyncio.Lock()
+        self._stdout_encoding = None
         for stream, file in ((Stream.STDOUT, sys.stdout), (Stream.STDERR, sys.stderr)):
             binary = getattr(file, "buffer", None)
             if binary is not None:
@@ -139,13 +160,31 @@ class ConsoleOutput:
                 self.sinks[stream] = raw
                 if target := _terminal_encoding(file, raw):
                     self.transcoders[stream] = _Transcoder(encoding, target)
+                    if stream is Stream.STDOUT:
+                        self._stdout_encoding = target
 
     async def write(self, stream: Stream, data: bytes, *, final: bool = False) -> None:
         if stream not in self.sinks:
             return
         if transcoder := self.transcoders.get(stream):
             data = transcoder.convert(data, final=final)
-        if not data:
+        if stream is Stream.STDOUT:
+            async with self._stdout_lock:
+                await self._emit(stream, data)
+        else:
+            await self._emit(stream, data)
+
+    async def echo_input(self, text: str) -> None:
+        if self._stdout_encoding is None:
+            return
+        text = _visible_input(text)
+        if os.name == "nt":
+            text = text.replace("\n", "\r\n")
+        async with self._stdout_lock:
+            await self._emit(Stream.STDOUT, text.encode(self._stdout_encoding, "replace"))
+
+    async def _emit(self, stream: Stream, data: bytes) -> None:
+        if not data or stream not in self.sinks:
             return
         try:
             await asyncio.to_thread(self._write_all, stream, data)
@@ -187,9 +226,9 @@ async def _send_stdin_lines(client: InputClient, encoding: str) -> int:
     stopped = threading.Event()
     chunks: asyncio.Queue[bytes | OSError] = asyncio.Queue(maxsize=1)
 
-    async def send(data: bytes, *, final: bool = False) -> None:
+    async def send(data: bytes) -> None:
         if transcoder is not None:
-            data = transcoder.convert(data, final=final)
+            data = transcoder.convert(data)
         if data:
             await client.send(data)
 
@@ -215,20 +254,13 @@ async def _send_stdin_lines(client: InputClient, encoding: str) -> int:
                 return
 
     threading.Thread(target=read_stdin, name="side-cli-input", daemon=True).start()
-    pending = bytearray()
+    lines = _InputLines()
     try:
         while item := await chunks.get():
             if isinstance(item, OSError):
                 return 1
-            lines = item.split(b"\n")
-            pending.extend(lines[0])
-            if len(lines) > 1:
-                await send(bytes(pending) + b"\n")
-                for line in lines[1:-1]:
-                    await send(line + b"\n")
-                pending.clear()
-                pending.extend(lines[-1])
-        await send(bytes(pending), final=True)
+            for line in lines.feed(item):
+                await send(line)
         return 0
     finally:
         stopped.set()
@@ -258,6 +290,7 @@ async def _run_console(args: argparse.Namespace, ports: Ports) -> int:
     output = ConsoleOutput(args.encoding)
     supervisor = Supervisor(
         args.command, ports=ports, on_output=output.write,
+        on_input_echo=output.echo_input, input_encoding=args.encoding,
         close_stdin_on_eof=args.close_stdin_on_eof,
     )
     with ConsoleInterrupt(supervisor) as interrupts:
@@ -269,7 +302,9 @@ async def _run_console(args: argparse.Namespace, ports: Ports) -> int:
             local_input = None
             try:
                 if not args.no_local_stdin:
-                    local_input = _start_local_input(supervisor, args.close_stdin_on_eof, args.encoding)
+                    local_input = _start_local_input(
+                        supervisor, args.close_stdin_on_eof, args.encoding, output,
+                    )
                 return await supervisor.wait()
             finally:
                 if local_input is not None:
@@ -362,6 +397,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "panel":
             return asyncio.run(_run_panel(args.port, args.encoding))
         if args.action == "input":
+            if "\n".encode(args.encoding) != b"\n":
+                input_parser.error("--encoding must use a single LF byte for newlines")
             return asyncio.run(_run_input(args.port, args.encoding))
         ports = _parse_run_ports(run, args, defaults)
         if args.gui:

@@ -12,17 +12,22 @@ from time import monotonic
 from tkinter import ttk
 
 from .ansi import AnsiColors, ColorRun
-from .cli import ConsoleInterrupt, ConsoleOutput, show_ports
-from .supervisor import Ports, Stream, Supervisor
+from .cli import ConsoleInterrupt, ConsoleOutput, _visible_input, show_ports
+from .supervisor import INPUT_LINE_LIMIT, Ports, Stream, Supervisor
 
 
 class Window:
-    def __init__(self, root: tk.Tk, encoding: str, supervisor: Supervisor) -> None:
+    def __init__(
+        self, root: tk.Tk, encoding: str, supervisor: Supervisor, console: ConsoleOutput | None = None,
+    ) -> None:
         self.root = root
         self.encoding = encoding
         self.supervisor = supervisor
+        self.console = console
         self.closed = False
         self.send_task: asyncio.Task[None] | None = None
+        self._input_pending = ""
+        self._input_encoder = codecs.getincrementalencoder(encoding)()
         self.decoders = {
             stream: IncrementalNewlineDecoder(
                 codecs.getincrementaldecoder(encoding)("replace"), translate=True
@@ -113,6 +118,12 @@ class Window:
     def receive(self, stream: Stream, data: bytes) -> None:
         self.pending.extend(self.colors[stream].feed(self.decoders[stream].decode(data)))
 
+    async def echo_input(self, text: str) -> None:
+        if visible := _visible_input(text):
+            self.pending.append((visible, (None, None)))
+        if self.console is not None:
+            await self.console.echo_input(text)
+
     def finish_output(self) -> None:
         for stream, decoder in self.decoders.items():
             self.pending.extend(self.colors[stream].feed(decoder.decode(b"", final=True), final=True))
@@ -177,13 +188,21 @@ class Window:
 
     async def send(self, text: str, payload: str) -> None:
         try:
-            await self.supervisor.send(payload.encode(self.encoding))
-        except (OSError, UnicodeError) as error:
+            *lines, tail = (self._input_pending + payload).split("\n")
+            if len(tail.encode(self.encoding)) >= INPUT_LINE_LIMIT or any(
+                len((line + "\n").encode(self.encoding)) > INPUT_LINE_LIMIT for line in lines
+            ):
+                raise ValueError("input line exceeds 1 MiB")
+            await self.echo_input(payload)
+            for line in lines:
+                await self.supervisor.send(self._input_encoder.encode(line + "\n"))
+            self._input_pending = tail
+        except (OSError, ValueError) as error:
             self.input_status.set(f"Send failed: {error}")
         else:
             if self.entry.get() == text:
                 self.entry.delete(0, tk.END)
-            self.input_status.set("")
+            self.input_status.set("Buffered until newline." if tail else "")
         finally:
             self.send_task = None
 
@@ -225,9 +244,10 @@ async def run_gui(args: argparse.Namespace, ports: Ports) -> int:
 
     supervisor = Supervisor(
         args.command, ports=ports, on_output=receive,
+        on_input_echo=lambda text: window.echo_input(text), input_encoding=args.encoding,
         close_stdin_on_eof=args.close_stdin_on_eof,
     )
-    window = Window(root, args.encoding, supervisor)
+    window = Window(root, args.encoding, supervisor, console)
     command = asyncio.create_task(window.run_command(args))
     try:
         while not window.closed:

@@ -1,4 +1,4 @@
-"""Async clients for the framed output and raw input listeners."""
+"""Async clients for framed output and line-framed input listeners."""
 
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ class PanelClient:
 
 
 class InputClient:
-    """Send bytes to a local stdin listener. Use an async context to connect."""
+    """Send LF-delimited bytes to stdin. Incomplete lines stay on this connection."""
 
     def __init__(self, port: int = Ports().stdin) -> None:
         _validate_port(port)

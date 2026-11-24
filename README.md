@@ -32,7 +32,9 @@ When the end of the output is visible, a blinking caret marks it without
 changing the text or taking keyboard focus.
 Click the output to focus the input field; selecting output text keeps focus
 in the output so it can be copied.
-On the right, **Send** writes the input text with an optional trailing newline.
+On the right, **Send** echoes the text immediately. Uncheck **Append newline**
+to add text to the pending line without writing to the child yet. Send a
+newline to deliver the full line, including the newline, to the child.
 The TCP panel shows each bound address, listening state, and active connection
 count. The window keeps the output visible after the command exits. Closing
 the window stops a command that is still running. GUI mode requires Tkinter
@@ -50,7 +52,8 @@ system Python on Debian or Ubuntu, install its `python3-tk` package if needed.
 - Configure ports with `--stdin-port`, `--stdout-port`, and `--stderr-port`.
   Use `0` for an available port and `--show-ports` to print the actual addresses.
   Listeners accept unauthenticated connections from the local machine only.
-- Stdin and the separate output ports carry raw bytes. Output goes to clients
+- The stdin port carries LF-delimited byte frames. Separate output ports
+  carry raw bytes. Output goes to clients
   connected at the time of the write, with no replay. To capture output from
   the first byte, use `--wait-for-output-clients` and connect to each enabled
   output port before the child starts. Keep output clients connected in both
@@ -58,11 +61,16 @@ system Python on Debian or Ubuntu, install its `python3-tk` package if needed.
   readers moving.
 - Both modes mirror the child's stdout and stderr separately. Console mode
   also forwards terminal or piped stdin, unless you set `--no-local-stdin`.
-  Terminal input, GUI input, and TCP input aren't exclusive; concurrent
-  sources can interleave at chunk boundaries. Input-source EOF keeps child
-  stdin open for other clients by default. Set `--close-stdin-on-eof` if the
-  child should receive EOF when the first input source ends. Combine it with
-  `--no-local-stdin` for commands that should read TCP input until EOF.
+  The GUI, local stdin, and each input connection buffer their own input
+  until a newline. Complete lines from concurrent sources can interleave
+  only between lines. On EOF an incomplete line is discarded; stdin stays
+  open for other clients unless `--close-stdin-on-eof` is set. Combine that
+  option with `--no-local-stdin` for commands that read TCP input until EOF.
+- Input echo is a local display feature. The GUI and the terminal running
+  `side-cli run` show submitted GUI and TCP input, even before a newline.
+  A terminal keyboard already provides its own echo. Synthetic echo is not
+  sent to the child, the TCP output ports, `panel`, or redirected stdout or
+  stderr. Output echoed by the child itself is still forwarded normally.
 - Ctrl+C reaches the child as `SIGINT` on Linux. On Windows, the child shares
   the console and receives the native Ctrl+C event directly. A child that
   handles the interrupt can clean up or continue. Console mode returns the
@@ -92,7 +100,8 @@ uv run side-cli input --port 8765 --encoding gb2312
 `run` converts terminal and GUI text in both directions. `panel` decodes
 output for the terminal, and `input` encodes lines typed at the terminal.
 Redirected files and pipes, TCP payloads, and the byte-oriented Python API
-do not transcode. Each client sets its own encoding for terminal display or
+do not transcode. Byte-framed input uses encodings with an ASCII LF, such as
+UTF-8, GB2312, and GBK. Each client sets its own encoding for terminal display or
 entry; the TCP protocol does not negotiate encodings.
 
 ## Single framed output port
@@ -125,16 +134,23 @@ uv run side-cli input --port 8765
 ```
 
 `input` writes nothing to stdout and reports connection errors to stderr.
-It forwards complete lines, preserving line endings, and sends any final
-unterminated line at local EOF. Multiple input clients can connect
-at once. Each client's byte order is preserved; writes from different clients
-can interleave at the supervisor's TCP read boundaries. Ctrl+C disconnects
+It forwards complete lines, preserving line endings, and drops any final
+unterminated line at local EOF. Multiple input clients can connect at once.
+Ctrl+C disconnects
 that input client without sending a signal or an orderly EOF to the child.
 An ordinary local EOF disconnects cleanly and leaves child stdin open unless
 the supervisor was started with `--close-stdin-on-eof`. Use separate terminals
 for the supervisor and its clients so Ctrl+C goes to the intended command.
 
 ### Frame format
+
+The **stdin** connection uses LF (`0x0a`) as the frame delimiter. A frame
+includes its delimiter; CRLF is passed through unchanged. One TCP read may
+contain several frames, and a single frame can span reads. The supervisor
+buffers at most 1 MiB per line, including the delimiter. An oversized line
+closes that input connection. An incomplete line is never written to the child.
+
+The combined **output** port uses a separate protocol:
 
 The connection carries consecutive binary frames with no initial preamble:
 
@@ -186,6 +202,10 @@ if __name__ == "__main__":
 `on_output` can also be an async function. It receives raw chunks in order
 within each stream; stdout and stderr may interleave. `status()` exposes port
 and connection information, including when the child has not started yet.
+`Supervisor.send()` is the low-level raw stdin write for programs that need
+to bypass line framing. To display TCP input separately, supply
+`on_input_echo` with a synchronous or async callback that receives text
+decoded with `input_encoding` (UTF-8 by default).
 Pass `Ports(stdin=0, output=0)` to enable framed mode with automatic ports.
 In this mode, `status()["output"]` reports the combined listener, and
 `on_output` still receives the original `Stream.STDOUT` or `Stream.STDERR`.
@@ -200,7 +220,8 @@ Import `PanelClient` and `InputClient` from `side_cli`. Both connect to the
 local supervisor as async context managers. `PanelClient` yields
 `(Stream.STDOUT, bytes)` or `(Stream.STDERR, bytes)` pairs until the connection
 ends; malformed or truncated frames raise `ValueError`. `InputClient.send()`
-writes bytes unchanged, and `send_line()` appends an LF if one is missing.
+writes bytes unchanged to the TCP connection, and `send_line()` appends an LF
+if one is missing. The supervisor only forwards complete LF-delimited lines.
 Context cancellation aborts the input connection rather than sending an
 orderly EOF. Use `close(abort=True)` for an explicit abort.
 

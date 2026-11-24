@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import inspect
 import os
 import signal
 import struct
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -17,6 +18,7 @@ from typing import Literal
 HOST = "127.0.0.1"
 CHUNK_SIZE = 64 * 1024
 CLIENT_BUFFER_LIMIT = 4 * 1024 * 1024
+INPUT_LINE_LIMIT = 1024 * 1024
 SHUTDOWN_TIMEOUT = 2.0
 
 
@@ -65,6 +67,29 @@ class PortStatus:
 
 
 OutputHandler = Callable[[Stream, bytes], Awaitable[None] | None]
+InputEcho = Callable[[str], Awaitable[None] | None]
+
+
+class _InputLines:
+    """Assemble LF-terminated byte frames for one input source."""
+
+    def __init__(self) -> None:
+        self.pending = bytearray()
+
+    def feed(self, data: bytes) -> Iterator[bytes]:
+        offset = 0
+        while offset < len(data):
+            newline = data.find(b"\n", offset)
+            end = len(data) if newline == -1 else newline + 1
+            if len(self.pending) + end - offset > INPUT_LINE_LIMIT:
+                raise ValueError("input line exceeds 1 MiB")
+            self.pending.extend(data[offset:end])
+            if newline == -1:
+                return
+            line = bytes(self.pending)
+            self.pending.clear()
+            offset = end
+            yield line
 
 
 def _piped_environment(
@@ -92,6 +117,8 @@ class Supervisor:
         *,
         ports: Ports = Ports(),
         on_output: OutputHandler | None = None,
+        on_input_echo: InputEcho | None = None,
+        input_encoding: str = "utf-8",
         close_stdin_on_eof: bool = False,
         cwd: str | os.PathLike[str] | None = None,
         env: Mapping[str, str] | None = None,
@@ -113,6 +140,8 @@ class Supervisor:
         self._process: asyncio.subprocess.Process | None = None
         self._completion: asyncio.Task[int] | None = None
         self._on_output = on_output
+        self._on_input_echo = on_input_echo
+        self._input_decoder = codecs.getincrementaldecoder(input_encoding) if on_input_echo else None
         self._close_stdin_on_eof = close_stdin_on_eof
         self._cwd = cwd
         self._env = env
@@ -323,18 +352,37 @@ class Supervisor:
         self, endpoint: Endpoint, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            while data := await reader.read(CHUNK_SIZE):
-                if endpoint is Stream.STDIN:
-                    await self._started.wait()
-                    await self.send(data)
-            if endpoint is Stream.STDIN and self._close_stdin_on_eof:
-                await self._started.wait()
-                await self.close_stdin()
-        except OSError:
+            if endpoint is Stream.STDIN:
+                await self._serve_input(reader)
+                return
+            while await reader.read(CHUNK_SIZE):
+                pass
+        except (OSError, ValueError):
             pass
         finally:
             self._clients[endpoint].discard(writer)
             writer.close()
+
+    async def _serve_input(self, reader: asyncio.StreamReader) -> None:
+        lines = _InputLines()
+        decoder = self._input_decoder("replace") if self._input_decoder is not None else None
+
+        async def echo(data: bytes, *, final: bool = False) -> None:
+            if decoder is not None and self._on_input_echo is not None:
+                if text := decoder.decode(data, final=final):
+                    result = self._on_input_echo(text)
+                    if inspect.isawaitable(result):
+                        await result
+
+        while data := await reader.read(CHUNK_SIZE):
+            await echo(data)
+            for line in lines.feed(data):
+                await self._started.wait()
+                await self.send(line)
+        await echo(b"", final=True)
+        if self._close_stdin_on_eof:
+            await self._started.wait()
+            await self.close_stdin()
 
     async def _close_network(self) -> None:
         servers = tuple(self._servers.values())
