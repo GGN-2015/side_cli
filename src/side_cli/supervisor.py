@@ -1,0 +1,326 @@
+"""Shared subprocess and TCP implementation."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import os
+import signal
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
+from dataclasses import dataclass
+from enum import StrEnum
+from types import TracebackType
+
+HOST = "127.0.0.1"
+CHUNK_SIZE = 64 * 1024
+CLIENT_BUFFER_LIMIT = 4 * 1024 * 1024
+SHUTDOWN_TIMEOUT = 2.0
+
+
+class Stream(StrEnum):
+    STDIN = "stdin"
+    STDOUT = "stdout"
+    STDERR = "stderr"
+
+
+@dataclass(frozen=True, slots=True)
+class Ports:
+    """Requested TCP ports; zero asks the OS to allocate an available port."""
+
+    stdin: int = 8765
+    stdout: int = 8766
+    stderr: int = 8767
+
+    def __post_init__(self) -> None:
+        ports = (self.stdin, self.stdout, self.stderr)
+        if any(type(port) is not int or not 0 <= port <= 65535 for port in ports):
+            raise ValueError("ports must be integers between 0 and 65535")
+        fixed = [port for port in ports if port]
+        if len(set(fixed)) != len(fixed):
+            raise ValueError("stdin, stdout, and stderr must use different ports")
+
+
+@dataclass(frozen=True, slots=True)
+class PortStatus:
+    stream: Stream
+    host: str
+    port: int
+    listening: bool
+    clients: int
+
+
+OutputHandler = Callable[[Stream, bytes], Awaitable[None] | None]
+
+
+class Supervisor:
+    """Run one command with piped standard streams on the current asyncio loop."""
+
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        ports: Ports = Ports(),
+        on_output: OutputHandler | None = None,
+        close_stdin_on_eof: bool = False,
+        cwd: str | os.PathLike[str] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
+        if isinstance(command, str) or not command or not command[0]:
+            raise ValueError("command must be a nonempty argument sequence")
+        self.command = tuple(command)
+        self._ports = ports
+        self._bound_ports: dict[Stream, int] = {}
+        self._servers: dict[Stream, asyncio.Server] = {}
+        self._clients: dict[Stream, set[asyncio.StreamWriter]] = {
+            stream: set() for stream in Stream
+        }
+        self._client_tasks: set[asyncio.Task[None]] = set()
+        self._connections_changed = asyncio.Event()
+        self._started = asyncio.Event()
+        self._stdin_lock = asyncio.Lock()
+        self._process: asyncio.subprocess.Process | None = None
+        self._completion: asyncio.Task[int] | None = None
+        self._on_output = on_output
+        self._close_stdin_on_eof = close_stdin_on_eof
+        self._cwd = cwd
+        self._env = env
+        self._closed = False
+
+    async def __aenter__(self) -> Supervisor:
+        await self.listen()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    @property
+    def pid(self) -> int | None:
+        return None if self._process is None else self._process.pid
+
+    @property
+    def returncode(self) -> int | None:
+        return None if self._process is None else self._process.returncode
+
+    @property
+    def stdin_open(self) -> bool:
+        return (
+            self._process is not None
+            and self._process.returncode is None
+            and self._process.stdin is not None
+            and not self._process.stdin.is_closing()
+        )
+
+    def status(self) -> dict[Stream, PortStatus]:
+        """Return a snapshot of the bound ports and active client counts."""
+        return {
+            stream: PortStatus(
+                stream,
+                HOST,
+                self._bound_ports.get(stream, getattr(self._ports, stream)),
+                stream in self._servers and self._servers[stream].is_serving(),
+                len(self._clients[stream]),
+            )
+            for stream in Stream
+        }
+
+    async def listen(self) -> None:
+        """Bind all three ports without launching the command."""
+        if self._closed:
+            raise RuntimeError("supervisor is closed")
+        if self._servers:
+            return
+        try:
+            for stream in Stream:
+                def connected(
+                    reader: asyncio.StreamReader,
+                    writer: asyncio.StreamWriter,
+                    stream: Stream = stream,
+                ) -> None:
+                    self._connect(stream, reader, writer)
+
+                server = await asyncio.start_server(
+                    connected, HOST, getattr(self._ports, stream), start_serving=False
+                )
+                self._servers[stream] = server
+                self._bound_ports[stream] = server.sockets[0].getsockname()[1]
+            for server in self._servers.values():
+                await server.start_serving()
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def wait_for_output_clients(self) -> None:
+        """Wait until both output ports have at least one connected reader."""
+        while self._servers:
+            if self._clients[Stream.STDOUT] and self._clients[Stream.STDERR]:
+                return
+            self._connections_changed.clear()
+            await self._connections_changed.wait()
+        raise RuntimeError("output ports are not listening")
+
+    async def start(self) -> None:
+        """Bind the listeners if necessary and launch the command without a shell."""
+        if self._process is not None:
+            raise RuntimeError("the command has already been started")
+        await self.listen()
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                *self.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self._cwd,
+                env=self._env,
+                start_new_session=os.name == "posix",
+            )
+        except BaseException:
+            await self.aclose()
+            raise
+        self._started.set()
+        self._completion = asyncio.create_task(self._run(self._process))
+
+    async def wait(self) -> int:
+        """Return the child's exit code after draining stdout and stderr."""
+        if self._completion is None:
+            raise RuntimeError("the command has not been started")
+        return await asyncio.shield(self._completion)
+
+    async def send(self, data: bytes) -> None:
+        """Write bytes to the child's stdin, or raise BrokenPipeError if closed."""
+        async with self._stdin_lock:
+            if not self.stdin_open or self._process is None:
+                raise BrokenPipeError("child stdin is not open")
+            writer = self._process.stdin
+            assert writer is not None
+            writer.write(data)
+            await writer.drain()
+
+    async def close_stdin(self) -> None:
+        """Send EOF to the child after all preceding writes."""
+        async with self._stdin_lock:
+            if self._process is not None and self._process.stdin is not None:
+                self._process.stdin.close()
+
+    def forward_console_interrupt(self) -> None:
+        """Relay a terminal interrupt on POSIX; Windows delivers it natively."""
+        if os.name == "posix":
+            self._stop(signal.SIGINT)
+
+    def terminate(self) -> None:
+        """Terminate the child (and its process group on POSIX)."""
+        self._stop(signal.SIGTERM)
+
+    async def aclose(self) -> None:
+        """Stop a running command and release sockets; safe to call more than once."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._completion is not None and not self._completion.done():
+            self.terminate()
+            try:
+                await asyncio.wait_for(self.wait(), SHUTDOWN_TIMEOUT)
+            except TimeoutError:
+                self._stop(signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(self.wait(), SHUTDOWN_TIMEOUT)
+                except TimeoutError:
+                    self._completion.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self._completion
+        await self._close_network()
+
+    def _stop(self, signum: int) -> None:
+        if self._process is None:
+            return
+        with suppress(ProcessLookupError):
+            if os.name == "posix":
+                os.killpg(self._process.pid, signum)
+            elif self._process.returncode is None:
+                self._process.terminate()
+
+    async def _run(self, process: asyncio.subprocess.Process) -> int:
+        assert process.stdout is not None and process.stderr is not None
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self._pump(Stream.STDOUT, process.stdout))
+                tasks.create_task(self._pump(Stream.STDERR, process.stderr))
+                return await process.wait()
+        except BaseException:
+            self._stop(signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
+            raise
+        finally:
+            await self._close_network()
+
+    async def _pump(self, stream: Stream, reader: asyncio.StreamReader) -> None:
+        while data := await reader.read(CHUNK_SIZE):
+            for writer in tuple(self._clients[stream]):
+                if writer.is_closing():
+                    continue
+                writer.write(data)
+                if writer.transport.get_write_buffer_size() > CLIENT_BUFFER_LIMIT:
+                    writer.transport.abort()
+            if self._on_output is not None:
+                result = self._on_output(stream, data)
+                if inspect.isawaitable(result):
+                    await result
+
+    def _connect(
+        self, stream: Stream, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        if stream not in self._servers:
+            writer.close()
+            return
+        self._clients[stream].add(writer)
+        self._connections_changed.set()
+        task = asyncio.create_task(self._serve_client(stream, reader, writer))
+        self._client_tasks.add(task)
+        task.add_done_callback(self._client_tasks.discard)
+
+    async def _serve_client(
+        self, stream: Stream, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            while data := await reader.read(CHUNK_SIZE):
+                if stream is Stream.STDIN:
+                    await self._started.wait()
+                    await self.send(data)
+            if stream is Stream.STDIN and self._close_stdin_on_eof:
+                await self._started.wait()
+                await self.close_stdin()
+        except OSError:
+            pass
+        finally:
+            self._clients[stream].discard(writer)
+            writer.close()
+
+    async def _close_network(self) -> None:
+        servers = tuple(self._servers.values())
+        if not servers:
+            return
+        self._servers.clear()
+        self._connections_changed.set()
+        for server in servers:
+            server.close()
+        writers = [writer for clients in self._clients.values() for writer in clients]
+        for clients in self._clients.values():
+            clients.clear()
+        for task in tuple(self._client_tasks):
+            task.cancel()
+        for writer in writers:
+            writer.close()
+        try:
+            async with asyncio.timeout(SHUTDOWN_TIMEOUT):
+                await asyncio.gather(
+                    *(writer.wait_closed() for writer in writers),
+                    *(server.wait_closed() for server in servers),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            for writer in writers:
+                writer.transport.abort()
