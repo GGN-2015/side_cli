@@ -163,9 +163,14 @@ def main(argv: list[str] | None = None) -> int:
         usage="%(prog)s [options] -- command [arguments ...]",
     )
     parser.add_argument("--gui", action="store_true", help="open the desktop interface")
-    for stream in Stream:
-        parser.add_argument(f"--{stream}-port", type=int, default=getattr(Ports(), stream),
-                            help=f"TCP port for {stream} (default: %(default)s; 0: auto)")
+    default_ports = Ports()
+    parser.add_argument("--stdin-port", type=int, default=default_ports.stdin,
+                        help="TCP port for stdin (default: %(default)s; 0: auto)")
+    for stream in (Stream.STDOUT, Stream.STDERR):
+        parser.add_argument(f"--{stream}-port", type=int,
+                            help=f"TCP port for {stream} (default: {getattr(default_ports, stream)}; 0: auto)")
+    parser.add_argument("--output-port", type=int,
+                        help="one TCP port for framed stdout and stderr (replaces both output ports; 0: auto)")
     parser.add_argument("--show-ports", action="store_true", help="print bound ports to stderr")
     parser.add_argument("--wait-for-output-clients", action="store_true",
                         help="wait for a client on each output port before launching")
@@ -181,8 +186,15 @@ def main(argv: list[str] | None = None) -> int:
         del args.command[0]
     if not args.command or not args.command[0]:
         parser.error("a command is required")
+    if args.output_port is not None and (args.stdout_port is not None or args.stderr_port is not None):
+        parser.error("--output-port cannot be combined with --stdout-port or --stderr-port")
     try:
-        ports = Ports(args.stdin_port, args.stdout_port, args.stderr_port)
+        ports = Ports(
+            stdin=args.stdin_port,
+            stdout=default_ports.stdout if args.stdout_port is None else args.stdout_port,
+            stderr=default_ports.stderr if args.stderr_port is None else args.stderr_port,
+            output=args.output_port,
+        )
         decoder = codecs.getincrementaldecoder(args.encoding)
         if not isinstance(decoder("replace").decode(b""), str):
             raise ValueError(f"{args.encoding!r} is not a text encoding")

@@ -6,11 +6,13 @@ import asyncio
 import inspect
 import os
 import signal
+import struct
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from types import TracebackType
+from typing import Literal
 
 HOST = "127.0.0.1"
 CHUNK_SIZE = 64 * 1024
@@ -24,26 +26,37 @@ class Stream(StrEnum):
     STDERR = "stderr"
 
 
+Endpoint = Stream | Literal["output"]
+_FRAME_HEADER = struct.Struct("!BI")
+_OUTPUT_STREAM_IDS = {Stream.STDOUT: 1, Stream.STDERR: 2}
+
+
 @dataclass(frozen=True, slots=True)
 class Ports:
-    """Requested TCP ports; zero asks the OS to allocate an available port."""
+    """TCP ports; zero requests an available port. Output overrides stdout and stderr."""
 
     stdin: int = 8765
     stdout: int = 8766
     stderr: int = 8767
+    output: int | None = None
 
     def __post_init__(self) -> None:
-        ports = (self.stdin, self.stdout, self.stderr)
+        ports = self._bindings().values()
         if any(type(port) is not int or not 0 <= port <= 65535 for port in ports):
             raise ValueError("ports must be integers between 0 and 65535")
         fixed = [port for port in ports if port]
         if len(set(fixed)) != len(fixed):
-            raise ValueError("stdin, stdout, and stderr must use different ports")
+            raise ValueError("active TCP listeners must use different ports")
+
+    def _bindings(self) -> dict[Endpoint, int]:
+        if self.output is not None:
+            return {Stream.STDIN: self.stdin, "output": self.output}
+        return {Stream.STDIN: self.stdin, Stream.STDOUT: self.stdout, Stream.STDERR: self.stderr}
 
 
 @dataclass(frozen=True, slots=True)
 class PortStatus:
-    stream: Stream
+    stream: Endpoint
     host: str
     port: int
     listening: bool
@@ -69,11 +82,12 @@ class Supervisor:
         if isinstance(command, str) or not command or not command[0]:
             raise ValueError("command must be a nonempty argument sequence")
         self.command = tuple(command)
-        self._ports = ports
-        self._bound_ports: dict[Stream, int] = {}
-        self._servers: dict[Stream, asyncio.Server] = {}
-        self._clients: dict[Stream, set[asyncio.StreamWriter]] = {
-            stream: set() for stream in Stream
+        self._port_bindings = ports._bindings()
+        self._merged_output = ports.output is not None
+        self._bound_ports: dict[Endpoint, int] = {}
+        self._servers: dict[Endpoint, asyncio.Server] = {}
+        self._clients: dict[Endpoint, set[asyncio.StreamWriter]] = {
+            endpoint: set() for endpoint in self._port_bindings
         }
         self._client_tasks: set[asyncio.Task[None]] = set()
         self._connections_changed = asyncio.Event()
@@ -116,39 +130,39 @@ class Supervisor:
             and not self._process.stdin.is_closing()
         )
 
-    def status(self) -> dict[Stream, PortStatus]:
+    def status(self) -> dict[Endpoint, PortStatus]:
         """Return a snapshot of the bound ports and active client counts."""
         return {
-            stream: PortStatus(
-                stream,
+            endpoint: PortStatus(
+                endpoint,
                 HOST,
-                self._bound_ports.get(stream, getattr(self._ports, stream)),
-                stream in self._servers and self._servers[stream].is_serving(),
-                len(self._clients[stream]),
+                self._bound_ports.get(endpoint, port),
+                endpoint in self._servers and self._servers[endpoint].is_serving(),
+                len(self._clients[endpoint]),
             )
-            for stream in Stream
+            for endpoint, port in self._port_bindings.items()
         }
 
     async def listen(self) -> None:
-        """Bind all three ports without launching the command."""
+        """Bind the configured ports without launching the command."""
         if self._closed:
             raise RuntimeError("supervisor is closed")
         if self._servers:
             return
         try:
-            for stream in Stream:
+            for endpoint, port in self._port_bindings.items():
                 def connected(
                     reader: asyncio.StreamReader,
                     writer: asyncio.StreamWriter,
-                    stream: Stream = stream,
+                    endpoint: Endpoint = endpoint,
                 ) -> None:
-                    self._connect(stream, reader, writer)
+                    self._connect(endpoint, reader, writer)
 
                 server = await asyncio.start_server(
-                    connected, HOST, getattr(self._ports, stream), start_serving=False
+                    connected, HOST, port, start_serving=False
                 )
-                self._servers[stream] = server
-                self._bound_ports[stream] = server.sockets[0].getsockname()[1]
+                self._servers[endpoint] = server
+                self._bound_ports[endpoint] = server.sockets[0].getsockname()[1]
             for server in self._servers.values():
                 await server.start_serving()
         except BaseException:
@@ -156,9 +170,9 @@ class Supervisor:
             raise
 
     async def wait_for_output_clients(self) -> None:
-        """Wait until both output ports have at least one connected reader."""
+        """Wait until each output port has at least one connected reader."""
         while self._servers:
-            if self._clients[Stream.STDOUT] and self._clients[Stream.STDERR]:
+            if all(clients for endpoint, clients in self._clients.items() if endpoint is not Stream.STDIN):
                 return
             self._connections_changed.clear()
             await self._connections_changed.wait()
@@ -258,45 +272,51 @@ class Supervisor:
             await self._close_network()
 
     async def _pump(self, stream: Stream, reader: asyncio.StreamReader) -> None:
+        endpoint: Endpoint = "output" if self._merged_output else stream
+        clients = self._clients[endpoint]
         while data := await reader.read(CHUNK_SIZE):
-            for writer in tuple(self._clients[stream]):
-                if writer.is_closing():
-                    continue
-                writer.write(data)
-                if writer.transport.get_write_buffer_size() > CLIENT_BUFFER_LIMIT:
-                    writer.transport.abort()
+            if clients:
+                packet = data
+                if self._merged_output:
+                    packet = _FRAME_HEADER.pack(_OUTPUT_STREAM_IDS[stream], len(data)) + data
+                for writer in tuple(clients):
+                    if writer.is_closing():
+                        continue
+                    writer.write(packet)
+                    if writer.transport.get_write_buffer_size() > CLIENT_BUFFER_LIMIT:
+                        writer.transport.abort()
             if self._on_output is not None:
                 result = self._on_output(stream, data)
                 if inspect.isawaitable(result):
                     await result
 
     def _connect(
-        self, stream: Stream, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self, endpoint: Endpoint, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        if stream not in self._servers:
+        if endpoint not in self._servers:
             writer.close()
             return
-        self._clients[stream].add(writer)
+        self._clients[endpoint].add(writer)
         self._connections_changed.set()
-        task = asyncio.create_task(self._serve_client(stream, reader, writer))
+        task = asyncio.create_task(self._serve_client(endpoint, reader, writer))
         self._client_tasks.add(task)
         task.add_done_callback(self._client_tasks.discard)
 
     async def _serve_client(
-        self, stream: Stream, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self, endpoint: Endpoint, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
             while data := await reader.read(CHUNK_SIZE):
-                if stream is Stream.STDIN:
+                if endpoint is Stream.STDIN:
                     await self._started.wait()
                     await self.send(data)
-            if stream is Stream.STDIN and self._close_stdin_on_eof:
+            if endpoint is Stream.STDIN and self._close_stdin_on_eof:
                 await self._started.wait()
                 await self.close_stdin()
         except OSError:
             pass
         finally:
-            self._clients[stream].discard(writer)
+            self._clients[endpoint].discard(writer)
             writer.close()
 
     async def _close_network(self) -> None:

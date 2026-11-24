@@ -16,9 +16,10 @@ from .supervisor import Ports, Stream, Supervisor
 
 
 class Window:
-    def __init__(self, root: tk.Tk, encoding: str) -> None:
+    def __init__(self, root: tk.Tk, encoding: str, supervisor: Supervisor) -> None:
         self.root = root
         self.encoding = encoding
+        self.supervisor = supervisor
         self.closed = False
         self.send_task: asyncio.Task[None] | None = None
         self.decoders = {
@@ -33,7 +34,9 @@ class Window:
         self.process_status = tk.StringVar(value="Starting listeners...")
         self.input_status = tk.StringVar()
         self.add_newline = tk.BooleanVar(value=True)
-        self.port_values = {stream: tk.StringVar(value="Not listening") for stream in Stream}
+        self.port_values = {
+            endpoint: tk.StringVar(value="Not listening") for endpoint in supervisor.status()
+        }
 
         root.title("side-cli")
         root.geometry("1040x590")
@@ -78,11 +81,12 @@ class Window:
 
         ports_panel = ttk.LabelFrame(sidebar, text="TCP ports", padding=10)
         ports_panel.pack(fill=tk.X, pady=(12, 0))
-        for row, stream in enumerate(Stream):
-            ttk.Label(ports_panel, text=stream.upper()).grid(
+        for row, (endpoint, value) in enumerate(self.port_values.items()):
+            label = "STDOUT / STDERR" if endpoint == "output" else endpoint.upper()
+            ttk.Label(ports_panel, text=label).grid(
                 row=row, column=0, sticky="nw", padx=(0, 14), pady=(0, 8)
             )
-            ttk.Label(ports_panel, textvariable=self.port_values[stream]).grid(
+            ttk.Label(ports_panel, textvariable=value).grid(
                 row=row, column=1, sticky="w", pady=(0, 8)
             )
         ttk.Label(sidebar, textvariable=self.process_status, wraplength=270).pack(
@@ -161,7 +165,10 @@ class Window:
                     if args.show_ports:
                         show_ports(self.supervisor)
                     if args.wait_for_output_clients:
-                        self.process_status.set("Waiting for stdout and stderr clients...")
+                        if "output" in self.port_values:
+                            self.process_status.set("Waiting for an output client...")
+                        else:
+                            self.process_status.set("Waiting for stdout and stderr clients...")
                     if not await interrupts.launch(args.wait_for_output_clients):
                         self.process_status.set("Launch interrupted.")
                         return 130
@@ -181,17 +188,17 @@ async def run_gui(args: argparse.Namespace, ports: Ports) -> int:
         root = tk.Tk()
     except tk.TclError as error:
         raise RuntimeError(f"cannot open the Tk desktop window: {error}") from error
-    window = Window(root, args.encoding)
     console = ConsoleOutput(args.encoding)
 
     async def receive(stream: Stream, data: bytes) -> None:
         window.receive(stream, data)
         await console.write(stream, data)
 
-    window.supervisor = Supervisor(
+    supervisor = Supervisor(
         args.command, ports=ports, on_output=receive,
         close_stdin_on_eof=args.close_stdin_on_eof,
     )
+    window = Window(root, args.encoding, supervisor)
     command = asyncio.create_task(window.run_command(args))
     try:
         while not window.closed:

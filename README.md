@@ -1,7 +1,8 @@
 # side-cli
 
-Run a command with piped standard streams and bridge them to three local TCP
-ports. Use the console, the Tk desktop window, or the async Python API.
+Run a command with piped standard streams and bridge them to local TCP ports.
+Use the console, the Tk desktop window, or the async Python API. Receive
+stdout and stderr on separate ports or on one framed output port.
 
 ## Quick start
 
@@ -44,11 +45,12 @@ system Python on Debian or Ubuntu, install its `python3-tk` package if needed.
 - Configure ports with `--stdin-port`, `--stdout-port`, and `--stderr-port`.
   Use `0` for an available port and `--show-ports` to print the actual addresses.
   Listeners accept unauthenticated connections from the local machine only.
-- The TCP streams carry raw bytes. Output goes to clients connected at the
-  time of the write, with no replay. To capture output from the first byte,
-  use `--wait-for-output-clients` and connect to both output ports before the
-  child starts. Keep output clients connected in both directions until done.
-  A slow client may be disconnected to keep other readers moving.
+- Stdin and the separate output ports carry raw bytes. Output goes to clients
+  connected at the time of the write, with no replay. To capture output from
+  the first byte, use `--wait-for-output-clients` and connect to each enabled
+  output port before the child starts. Keep output clients connected in both
+  directions until done. A slow client may be disconnected to keep other
+  readers moving.
 - Both modes mirror the child's stdout and stderr separately. Console mode
   also forwards terminal or piped stdin, unless you set `--no-local-stdin`.
   Terminal input, GUI input, and TCP input aren't exclusive; concurrent
@@ -67,6 +69,57 @@ system Python on Debian or Ubuntu, install its `python3-tk` package if needed.
   command disables colors when writing to a pipe, use its force-color option.
   The GUI uses UTF-8 by default; `--encoding` changes GUI input/output and
   Windows console output decoding.
+
+## Single framed output port
+
+Set `--output-port` to replace both output TCP listeners with one connection
+point carrying both streams. This option cannot be combined with
+`--stdout-port` or `--stderr-port`. The stdin listener, local output, and GUI
+ANSI rendering keep their existing behavior. The GUI and `--show-ports`
+report one combined output listener; `--wait-for-output-clients` waits for
+one client on it.
+
+```shell
+uv run side-cli --output-port 8766 --wait-for-output-clients -- python -u -c "import sys; print('Ready'); print('Status', file=sys.stderr)"
+```
+
+The connection carries consecutive binary frames with no initial preamble:
+
+| Field | Size | Value |
+| --- | --- | --- |
+| Stream ID | 1 byte | `1` = stdout, `2` = stderr |
+| Payload length | 4 bytes | Unsigned big-endian byte count, 1–65,536 |
+| Payload | As specified above | Raw bytes from the selected stream, including ANSI escapes |
+
+Read five bytes for the header, then exactly the specified number of payload
+bytes. Frames represent chunks, not lines, characters, or individual child
+writes. Each stream retains its own byte order. Frames from the two streams
+interleave in the order side-cli reads them. EOF at a frame boundary ends the
+connection; EOF inside a frame indicates truncation.
+
+Run this Python receiver in another terminal to decode the example:
+
+```python
+import socket
+import struct
+import sys
+
+destinations = {1: sys.stdout.buffer, 2: sys.stderr.buffer}
+with socket.create_connection(("127.0.0.1", 8766)) as connection:
+    with connection.makefile("rb") as reader:
+        while header := reader.read(5):
+            if len(header) != 5:
+                raise EOFError("incomplete output frame header")
+            stream_id, length = struct.unpack("!BI", header)
+            if stream_id not in destinations or not 1 <= length <= 65_536:
+                raise ValueError("invalid output frame header")
+            payload = reader.read(length)
+            if len(payload) != length:
+                raise EOFError("incomplete output frame payload")
+            destination = destinations[stream_id]
+            destination.write(payload)
+            destination.flush()
+```
 
 ## Python API
 
@@ -104,6 +157,10 @@ if __name__ == "__main__":
 `on_output` can also be an async function. It receives raw chunks in order
 within each stream; stdout and stderr may interleave. `status()` exposes port
 and connection information, including when the child has not started yet.
+Pass `Ports(stdin=0, output=0)` to enable framed mode with automatic ports.
+In this mode, `status()["output"]` reports the combined listener, and
+`on_output` still receives the original `Stream.STDOUT` or `Stream.STDERR`.
+The `stdout` and `stderr` port settings apply only in separate-port mode.
 Call `listen()` directly if you need to bind before starting without a context
 manager, and use `aclose()` to clean up. An embedding app owns its own signal
 handlers. On Windows, use the default asyncio Proactor event loop.
