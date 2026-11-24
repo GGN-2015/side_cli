@@ -70,6 +70,9 @@ system Python on Debian or Ubuntu, install its `python3-tk` package if needed.
   command disables colors when writing to a pipe, use its force-color option.
   The GUI uses UTF-8 by default; `--encoding` changes GUI input/output and
   Windows console output decoding.
+- On Windows, when launching `cmd.exe` directly, side-cli removes Clink's
+  hidden tag from the child `PROMPT` but preserves the rest of the prompt.
+  Clink's interactive editing and completion still require a console.
 
 ## Single framed output port
 

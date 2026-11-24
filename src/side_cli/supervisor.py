@@ -29,6 +29,7 @@ class Stream(StrEnum):
 Endpoint = Stream | Literal["output"]
 _FRAME_HEADER = struct.Struct("!BI")
 _OUTPUT_STREAM_IDS = {Stream.STDOUT: 1, Stream.STDERR: 2}
+_CLINK_PROMPT_TAG = "C\bL\bI\bN\bK\b \b"
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +65,22 @@ class PortStatus:
 
 
 OutputHandler = Callable[[Stream, bytes], Awaitable[None] | None]
+
+
+def _piped_environment(
+    executable: str, env: Mapping[str, str] | None,
+) -> Mapping[str, str] | None:
+    """Remove Clink's inherited prompt tag when CMD cannot use its console hooks."""
+    if os.name != "nt" or os.path.basename(executable).casefold() not in {"cmd", "cmd.exe"}:
+        return env
+
+    source = os.environ if env is None else env
+    updates = {
+        name: value.removeprefix(_CLINK_PROMPT_TAG)
+        for name, value in source.items()
+        if name.upper() == "PROMPT" and value.startswith(_CLINK_PROMPT_TAG)
+    }
+    return {**source, **updates} if updates else env
 
 
 class Supervisor:
@@ -190,7 +207,7 @@ class Supervisor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd,
-                env=self._env,
+                env=_piped_environment(self.command[0], self._env),
                 start_new_session=os.name == "posix",
             )
         except BaseException:
