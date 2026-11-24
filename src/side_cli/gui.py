@@ -74,6 +74,8 @@ class Window:
         self.entry = ttk.Entry(input_panel)
         self.entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.entry.bind("<Return>", self.submit)
+        self.output.bind("<ButtonRelease-1>", self._focus_after_output_click)
+        self._caret.bind("<Button-1>", self._focus_after_output_click)
         self.send_button = ttk.Button(input_panel, text="Send", command=self.submit, state=tk.DISABLED)
         self.send_button.grid(row=0, column=1)
         ttk.Checkbutton(input_panel, text="Append newline", variable=self.add_newline).grid(
@@ -97,6 +99,12 @@ class Window:
             anchor=tk.W, pady=(12, 0)
         )
         self.entry.focus_set()
+
+    def _focus_after_output_click(self, event: tk.Event) -> None:
+        if event.widget is self.output and self.output.tag_ranges(tk.SEL):
+            self.output.focus_set()
+        else:
+            self.entry.focus_set()
 
     def close(self) -> None:
         self.closed = True

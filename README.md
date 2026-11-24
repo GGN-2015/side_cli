@@ -30,6 +30,8 @@ The GUI shows stdout and stderr in the left-hand console. Both use the same
 default colors; ANSI color sequences in each stream control their text colors.
 When the end of the output is visible, a blinking caret marks it without
 changing the text or taking keyboard focus.
+Click the output to focus the input field; selecting output text keeps focus
+in the output so it can be copied.
 On the right, **Send** writes the input text with an optional trailing newline.
 The TCP panel shows each bound address, listening state, and active connection
 count. The window keeps the output visible after the command exits. Closing
