@@ -8,6 +8,7 @@ import codecs
 import tkinter as tk
 from contextlib import suppress
 from io import IncrementalNewlineDecoder
+from time import monotonic
 from tkinter import ttk
 
 from .ansi import AnsiColors, ColorRun
@@ -63,6 +64,9 @@ class Window:
         self.output.configure(yscrollcommand=scrollbar.set)
         self.output.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._caret = tk.Frame(self.output, background=self.output.cget("foreground"), takefocus=False)
+        self._caret_position: tuple[int, int, int] | None = None
+        self._caret_epoch = monotonic()
 
         input_panel = ttk.LabelFrame(sidebar, text="Standard input", padding=10)
         input_panel.pack(fill=tk.X)
@@ -112,6 +116,21 @@ class Window:
             self._color_tags.add(tag)
         return tag
 
+    def _refresh_caret(self) -> None:
+        position = None
+        if (monotonic() - self._caret_epoch) % 1.0 < 0.5:
+            if bounds := self.output.bbox("end-1c"):
+                left, top, _, height = bounds
+                position = left, top, height
+        if position == self._caret_position:
+            return
+        self._caret_position = position
+        if position is None:
+            self._caret.place_forget()
+        else:
+            left, top, height = position
+            self._caret.place(x=left, y=top, width=2, height=height, bordermode="outside")
+
     def refresh(self) -> None:
         if self.pending:
             follow = self.output.yview()[1] >= 0.999
@@ -127,6 +146,8 @@ class Window:
             self.pending.clear()
             if follow:
                 self.output.see(tk.END)
+            self._caret_epoch = monotonic()
+        self._refresh_caret()
         for port in self.supervisor.status().values():
             state = "Listening" if port.listening else "Not listening"
             clients = "client" if port.clients == 1 else "clients"
