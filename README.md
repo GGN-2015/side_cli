@@ -12,17 +12,18 @@ or later and has no third-party runtime dependencies.
 
 ```shell
 uv sync --locked
-uv run side-cli -- python -u -c "import sys; print('Ready'); print('Status', file=sys.stderr); print(input())"
+uv run side-cli run -- python -u -c "import sys; print('Ready'); print('Status', file=sys.stderr); print(input())"
 ```
 
 Type a line in the terminal, or send it to the stdin TCP port. The example
 prints the line and exits. `side_cli` and `python -m side_cli` are also entry
-points. Put side-cli options before `--` and the child's arguments after it.
+points. Put `run` options before `--` and the child command and its arguments
+after it. Run `side-cli run --help` for supervisor options.
 Commands run directly; use an explicit shell for shell syntax, for example
 `-- sh -c "printf 'hello\n'"` on Linux or `-- cmd /c "echo hello"` on Windows.
 
 ```shell
-uv run side-cli --gui -- python -u -c "import sys; print('Ready'); print('Status', file=sys.stderr); print(input())"
+uv run side-cli run --gui -- python -u -c "import sys; print('Ready'); print('Status', file=sys.stderr); print(input())"
 ```
 
 The GUI shows stdout and stderr in the left-hand console. Both use the same
@@ -80,8 +81,36 @@ report one combined output listener; `--wait-for-output-clients` waits for
 one client on it.
 
 ```shell
-uv run side-cli --output-port 8766 --wait-for-output-clients -- python -u -c "import sys; print('Ready'); print('Status', file=sys.stderr)"
+uv run side-cli run --output-port 8766 --wait-for-output-clients --no-local-stdin -- python -u -c "import sys; print('Ready'); print('Status', file=sys.stderr); sys.stdout.writelines(sys.stdin)"
 ```
+
+In a second terminal, connect to the framed output port:
+
+```shell
+uv run side-cli panel --port 8766
+```
+
+`panel` writes frames to its own stdout or stderr according to their stream
+ID. Redirect either stream independently to capture its raw bytes. The child
+still writes to the supervisor's own stdout and stderr too.
+
+In a third terminal, send lines to the stdin port:
+
+```shell
+uv run side-cli input --port 8765
+```
+
+`input` writes nothing to stdout and reports connection errors to stderr.
+It forwards complete lines, preserving their bytes and newline, and sends
+any final unterminated line at local EOF. Multiple input clients can connect
+at once. Each client's byte order is preserved; writes from different clients
+can interleave at the supervisor's TCP read boundaries. Ctrl+C disconnects
+that input client without sending a signal or an orderly EOF to the child.
+An ordinary local EOF disconnects cleanly and leaves child stdin open unless
+the supervisor was started with `--close-stdin-on-eof`. Use separate terminals
+for the supervisor and its clients so Ctrl+C goes to the intended command.
+
+### Frame format
 
 The connection carries consecutive binary frames with no initial preamble:
 
@@ -96,30 +125,6 @@ bytes. Frames represent chunks, not lines, characters, or individual child
 writes. Each stream retains its own byte order. Frames from the two streams
 interleave in the order side-cli reads them. EOF at a frame boundary ends the
 connection; EOF inside a frame indicates truncation.
-
-Run this Python receiver in another terminal to decode the example:
-
-```python
-import socket
-import struct
-import sys
-
-destinations = {1: sys.stdout.buffer, 2: sys.stderr.buffer}
-with socket.create_connection(("127.0.0.1", 8766)) as connection:
-    with connection.makefile("rb") as reader:
-        while header := reader.read(5):
-            if len(header) != 5:
-                raise EOFError("incomplete output frame header")
-            stream_id, length = struct.unpack("!BI", header)
-            if stream_id not in destinations or not 1 <= length <= 65_536:
-                raise ValueError("invalid output frame header")
-            payload = reader.read(length)
-            if len(payload) != length:
-                raise EOFError("incomplete output frame payload")
-            destination = destinations[stream_id]
-            destination.write(payload)
-            destination.flush()
-```
 
 ## Python API
 
@@ -164,6 +169,35 @@ The `stdout` and `stderr` port settings apply only in separate-port mode.
 Call `listen()` directly if you need to bind before starting without a context
 manager, and use `aclose()` to clean up. An embedding app owns its own signal
 handlers. On Windows, use the default asyncio Proactor event loop.
+
+### TCP clients
+
+Import `PanelClient` and `InputClient` from `side_cli`. Both connect to the
+local supervisor as async context managers. `PanelClient` yields
+`(Stream.STDOUT, bytes)` or `(Stream.STDERR, bytes)` pairs until the connection
+ends; malformed or truncated frames raise `ValueError`. `InputClient.send()`
+writes bytes unchanged, and `send_line()` appends an LF if one is missing.
+Context cancellation aborts the input connection rather than sending an
+orderly EOF. Use `close(abort=True)` for an explicit abort.
+
+```python
+import sys
+
+from side_cli import InputClient, PanelClient, Stream
+
+
+async def receive_output(port: int = 8766) -> None:
+    async with PanelClient(port) as panel:
+        async for stream, data in panel:
+            destination = sys.stdout if stream is Stream.STDOUT else sys.stderr
+            destination.buffer.write(data)
+            destination.buffer.flush()
+
+
+async def send_input(port: int = 8765) -> None:
+    async with InputClient(port) as client:
+        await client.send_line(b"Hello from Python")
+```
 
 ## Build
 

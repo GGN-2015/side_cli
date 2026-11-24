@@ -12,6 +12,7 @@ import threading
 from concurrent.futures import CancelledError
 from contextlib import suppress
 
+from .clients import InputClient, PanelClient
 from .supervisor import CHUNK_SIZE, Ports, Stream, Supervisor
 
 
@@ -128,6 +129,83 @@ class ConsoleOutput:
             await self.write(stream, b"", final=True)
 
 
+async def _run_panel(port: int, encoding: str) -> int:
+    output = ConsoleOutput(encoding)
+    async with PanelClient(port) as client:
+        try:
+            async for stream, data in client:
+                await output.write(stream, data)
+        finally:
+            await output.finish()
+    return 0
+
+
+async def _send_stdin_lines(client: InputClient) -> int:
+    binary = getattr(sys.stdin, "buffer", None)
+    if binary is None:
+        return 0
+    raw = getattr(binary, "raw", binary)
+    loop = asyncio.get_running_loop()
+    stopped = threading.Event()
+    chunks: asyncio.Queue[bytes | OSError] = asyncio.Queue(maxsize=1)
+
+    def read_stdin() -> None:
+        while not stopped.is_set():
+            try:
+                item: bytes | OSError = raw.read(CHUNK_SIZE) or b""
+            except OSError as error:
+                item = error
+            if stopped.is_set():
+                return
+            operation = chunks.put(item)
+            try:
+                future = asyncio.run_coroutine_threadsafe(operation, loop)
+            except RuntimeError:
+                operation.close()
+                return
+            try:
+                future.result()
+            except CancelledError:
+                return
+            if not item or isinstance(item, OSError):
+                return
+
+    threading.Thread(target=read_stdin, name="side-cli-input", daemon=True).start()
+    pending = bytearray()
+    try:
+        while item := await chunks.get():
+            if isinstance(item, OSError):
+                return 1
+            lines = item.split(b"\n")
+            pending.extend(lines[0])
+            if len(lines) > 1:
+                await client.send_line(bytes(pending))
+                for line in lines[1:-1]:
+                    await client.send_line(line)
+                pending.clear()
+                pending.extend(lines[-1])
+        if pending:
+            await client.send(bytes(pending))
+        return 0
+    finally:
+        stopped.set()
+
+
+async def _run_input(port: int) -> int:
+    async with InputClient(port) as client:
+        sending = asyncio.create_task(_send_stdin_lines(client))
+        disconnected = asyncio.create_task(client.wait_for_disconnect())
+        try:
+            done, _ = await asyncio.wait((sending, disconnected), return_when=asyncio.FIRST_COMPLETED)
+            if disconnected in done:
+                disconnected.result()
+            return sending.result() if sending in done else 0
+        finally:
+            sending.cancel()
+            disconnected.cancel()
+            await asyncio.gather(sending, disconnected, return_exceptions=True)
+
+
 def show_ports(supervisor: Supervisor) -> None:
     for port in supervisor.status().values():
         print(f"side-cli: {port.stream} {port.host}:{port.port}", file=sys.stderr, flush=True)
@@ -156,19 +234,34 @@ async def _run_console(args: argparse.Namespace, ports: Ports) -> int:
                 await output.finish()
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="side-cli",
-        description="Run a command and bridge its standard streams over local TCP.",
-        usage="%(prog)s [options] -- command [arguments ...]",
-    )
+def _encoding(value: str) -> str:
+    try:
+        decoder = codecs.getincrementaldecoder(value)
+        if not isinstance(decoder("replace").decode(b""), str):
+            raise ValueError(f"{value!r} is not a text encoding")
+        "".encode(value)
+    except (ValueError, LookupError, TypeError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return value
+
+
+def _client_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer between 1 and 65535")
+    return port
+
+
+def _configure_run(parser: argparse.ArgumentParser, defaults: Ports) -> None:
     parser.add_argument("--gui", action="store_true", help="open the desktop interface")
-    default_ports = Ports()
-    parser.add_argument("--stdin-port", type=int, default=default_ports.stdin,
+    parser.add_argument("--stdin-port", type=int, default=defaults.stdin,
                         help="TCP port for stdin (default: %(default)s; 0: auto)")
     for stream in (Stream.STDOUT, Stream.STDERR):
         parser.add_argument(f"--{stream}-port", type=int,
-                            help=f"TCP port for {stream} (default: {getattr(default_ports, stream)}; 0: auto)")
+                            help=f"TCP port for {stream} (default: {getattr(defaults, stream)}; 0: auto)")
     parser.add_argument("--output-port", type=int,
                         help="one TCP port for framed stdout and stderr (replaces both output ports; 0: auto)")
     parser.add_argument("--show-ports", action="store_true", help="print bound ports to stderr")
@@ -178,10 +271,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="read stdin only from TCP in console mode")
     parser.add_argument("--close-stdin-on-eof", action="store_true",
                         help="close child stdin on EOF from a TCP or local input source")
-    parser.add_argument("--encoding", default="utf-8",
+    parser.add_argument("--encoding", type=_encoding, default="utf-8",
                         help="text encoding for GUI and Windows console output (default: utf-8)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
-    args = parser.parse_args(argv)
+
+
+def _parse_run_ports(parser: argparse.ArgumentParser, args: argparse.Namespace, defaults: Ports) -> Ports:
     if args.command and args.command[0] == "--":
         del args.command[0]
     if not args.command or not args.command[0]:
@@ -189,19 +284,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_port is not None and (args.stdout_port is not None or args.stderr_port is not None):
         parser.error("--output-port cannot be combined with --stdout-port or --stderr-port")
     try:
-        ports = Ports(
+        return Ports(
             stdin=args.stdin_port,
-            stdout=default_ports.stdout if args.stdout_port is None else args.stdout_port,
-            stderr=default_ports.stderr if args.stderr_port is None else args.stderr_port,
+            stdout=defaults.stdout if args.stdout_port is None else args.stdout_port,
+            stderr=defaults.stderr if args.stderr_port is None else args.stderr_port,
             output=args.output_port,
         )
-        decoder = codecs.getincrementaldecoder(args.encoding)
-        if not isinstance(decoder("replace").decode(b""), str):
-            raise ValueError(f"{args.encoding!r} is not a text encoding")
-        "".encode(args.encoding)
-    except (ValueError, LookupError, TypeError) as error:
+    except ValueError as error:
         parser.error(str(error))
+
+
+def main(argv: list[str] | None = None) -> int:
+    defaults = Ports()
+    parser = argparse.ArgumentParser(
+        prog="side-cli", description="Bridge a command's standard streams over local TCP."
+    )
+    commands = parser.add_subparsers(dest="action", required=True)
+    run = commands.add_parser("run", help="run and supervise a command",
+                              usage="%(prog)s [options] -- command [arguments ...]")
+    _configure_run(run, defaults)
+    panel = commands.add_parser("panel", help="mirror stdout and stderr from a framed output port")
+    panel.add_argument("--port", type=_client_port, default=defaults.stdout,
+                       help="framed output port (default: %(default)s)")
+    panel.add_argument("--encoding", type=_encoding, default="utf-8",
+                       help="text encoding for Windows console output (default: %(default)s)")
+    input_parser = commands.add_parser("input", help="send local stdin lines to a running command")
+    input_parser.add_argument("--port", type=_client_port, default=defaults.stdin,
+                              help="stdin port (default: %(default)s)")
+    args = parser.parse_args(argv)
     try:
+        if args.action == "panel":
+            return asyncio.run(_run_panel(args.port, args.encoding))
+        if args.action == "input":
+            return asyncio.run(_run_input(args.port))
+        ports = _parse_run_ports(run, args, defaults)
         if args.gui:
             try:
                 from .gui import run_gui
