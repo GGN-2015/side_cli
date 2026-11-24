@@ -68,11 +68,28 @@ system Python on Debian or Ubuntu, install its `python3-tk` package if needed.
   renders ANSI foreground and background colors (basic, bright, 256-color,
   and RGB), but does not emulate cursor movement or screen clearing. If a
   command disables colors when writing to a pipe, use its force-color option.
-  The GUI uses UTF-8 by default; `--encoding` changes GUI input/output and
-  Windows console output decoding.
 - On Windows, when launching `cmd.exe` directly, side-cli removes Clink's
   hidden tag from the child `PROMPT` but preserves the rest of the prompt.
   Clink's interactive editing and completion still require a console.
+
+## Text encoding
+
+`--encoding` describes the encoding used by the child process. It defaults to
+`utf-8` and accepts Python text encodings such as `gb2312`, `gbk`, and `cp936`.
+Choose the encoding that matches the command; the option does not change the
+child's locale or code page.
+
+```shell
+uv run side-cli run --gui --encoding gb2312 -- cmd.exe
+uv run side-cli panel --port 8766 --encoding gb2312
+uv run side-cli input --port 8765 --encoding gb2312
+```
+
+`run` converts terminal and GUI text in both directions. `panel` decodes
+output for the terminal, and `input` encodes lines typed at the terminal.
+Redirected files and pipes, TCP payloads, and the byte-oriented Python API
+do not transcode. Each client sets its own encoding for terminal display or
+entry; the TCP protocol does not negotiate encodings.
 
 ## Single framed output port
 
@@ -104,8 +121,8 @@ uv run side-cli input --port 8765
 ```
 
 `input` writes nothing to stdout and reports connection errors to stderr.
-It forwards complete lines, preserving their bytes and newline, and sends
-any final unterminated line at local EOF. Multiple input clients can connect
+It forwards complete lines, preserving line endings, and sends any final
+unterminated line at local EOF. Multiple input clients can connect
 at once. Each client's byte order is preserved; writes from different clients
 can interleave at the supervisor's TCP read boundaries. Ctrl+C disconnects
 that input client without sending a signal or an orderly EOF to the child.

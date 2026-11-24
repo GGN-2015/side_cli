@@ -11,6 +11,7 @@ import sys
 import threading
 from concurrent.futures import CancelledError
 from contextlib import suppress
+from typing import BinaryIO, TextIO
 
 from .clients import InputClient, PanelClient
 from .supervisor import CHUNK_SIZE, Ports, Stream, Supervisor
@@ -63,13 +64,43 @@ class ConsoleInterrupt:
         return True
 
 
-def _start_local_input(supervisor: Supervisor, close_on_eof: bool) -> threading.Event:
+def _terminal_encoding(file: TextIO, raw: BinaryIO) -> str | None:
+    if type(raw).__name__ == "_WindowsConsoleIO":
+        return "utf-8"
+    return (file.encoding or "utf-8") if file.isatty() else None
+
+
+class _Transcoder:
+    def __init__(self, source: str, target: str) -> None:
+        self.decoder = codecs.getincrementaldecoder(source)("replace")
+        self.encoder = codecs.getincrementalencoder(target)("replace")
+        self.started = False
+
+    def convert(self, data: bytes, *, final: bool = False) -> bytes:
+        text = self.decoder.decode(data, final=final)
+        if not text and not (self.started and final):
+            return b""
+        self.started = True
+        return self.encoder.encode(text, final=final)
+
+
+def _start_local_input(
+    supervisor: Supervisor, close_on_eof: bool, encoding: str,
+) -> threading.Event:
     loop = asyncio.get_running_loop()
     stopped = threading.Event()
     binary = getattr(sys.stdin, "buffer", None)
     if binary is None:
         return stopped
     raw = getattr(binary, "raw", binary)
+    terminal_encoding = _terminal_encoding(sys.stdin, raw)
+    transcoder = _Transcoder(terminal_encoding, encoding) if terminal_encoding else None
+
+    async def forward(data: bytes, eof: bool) -> None:
+        if data:
+            await supervisor.send(data)
+        if eof and close_on_eof:
+            await supervisor.close_stdin()
 
     def read_stdin() -> None:
         while not stopped.is_set():
@@ -77,16 +108,18 @@ def _start_local_input(supervisor: Supervisor, close_on_eof: bool) -> threading.
                 data = raw.read(CHUNK_SIZE)
                 if stopped.is_set() or data is None:
                     return
-                if not data and not close_on_eof:
-                    return
-                operation = supervisor.send(data) if data else supervisor.close_stdin()
-                try:
-                    future = asyncio.run_coroutine_threadsafe(operation, loop)
-                except RuntimeError:
-                    operation.close()
-                    return
-                future.result()
-                if not data:
+                eof = not data
+                if transcoder is not None:
+                    data = transcoder.convert(data, final=eof)
+                if data or (eof and close_on_eof):
+                    operation = forward(data, eof)
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(operation, loop)
+                    except RuntimeError:
+                        operation.close()
+                        return
+                    future.result()
+                if eof:
                     return
             except (OSError, RuntimeError, CancelledError):
                 return
@@ -98,19 +131,22 @@ def _start_local_input(supervisor: Supervisor, close_on_eof: bool) -> threading.
 class ConsoleOutput:
     def __init__(self, encoding: str) -> None:
         self.sinks = {}
-        self.decoders = {}
+        self.transcoders: dict[Stream, _Transcoder] = {}
         for stream, file in ((Stream.STDOUT, sys.stdout), (Stream.STDERR, sys.stderr)):
             binary = getattr(file, "buffer", None)
             if binary is not None:
-                self.sinks[stream] = getattr(binary, "raw", binary)
-                if os.name == "nt" and type(self.sinks[stream]).__name__ == "_WindowsConsoleIO":
-                    self.decoders[stream] = codecs.getincrementaldecoder(encoding)("replace")
+                raw = getattr(binary, "raw", binary)
+                self.sinks[stream] = raw
+                if target := _terminal_encoding(file, raw):
+                    self.transcoders[stream] = _Transcoder(encoding, target)
 
     async def write(self, stream: Stream, data: bytes, *, final: bool = False) -> None:
         if stream not in self.sinks:
             return
-        if stream in self.decoders:
-            data = self.decoders[stream].decode(data, final=final).encode("utf-8")
+        if transcoder := self.transcoders.get(stream):
+            data = transcoder.convert(data, final=final)
+        if not data:
+            return
         try:
             await asyncio.to_thread(self._write_all, stream, data)
         except OSError:
@@ -125,7 +161,7 @@ class ConsoleOutput:
             remaining = remaining[written:]
 
     async def finish(self) -> None:
-        for stream in self.decoders:
+        for stream in self.transcoders:
             await self.write(stream, b"", final=True)
 
 
@@ -140,14 +176,22 @@ async def _run_panel(port: int, encoding: str) -> int:
     return 0
 
 
-async def _send_stdin_lines(client: InputClient) -> int:
+async def _send_stdin_lines(client: InputClient, encoding: str) -> int:
     binary = getattr(sys.stdin, "buffer", None)
     if binary is None:
         return 0
     raw = getattr(binary, "raw", binary)
+    terminal_encoding = _terminal_encoding(sys.stdin, raw)
+    transcoder = _Transcoder(terminal_encoding, encoding) if terminal_encoding else None
     loop = asyncio.get_running_loop()
     stopped = threading.Event()
     chunks: asyncio.Queue[bytes | OSError] = asyncio.Queue(maxsize=1)
+
+    async def send(data: bytes, *, final: bool = False) -> None:
+        if transcoder is not None:
+            data = transcoder.convert(data, final=final)
+        if data:
+            await client.send(data)
 
     def read_stdin() -> None:
         while not stopped.is_set():
@@ -179,21 +223,20 @@ async def _send_stdin_lines(client: InputClient) -> int:
             lines = item.split(b"\n")
             pending.extend(lines[0])
             if len(lines) > 1:
-                await client.send_line(bytes(pending))
+                await send(bytes(pending) + b"\n")
                 for line in lines[1:-1]:
-                    await client.send_line(line)
+                    await send(line + b"\n")
                 pending.clear()
                 pending.extend(lines[-1])
-        if pending:
-            await client.send(bytes(pending))
+        await send(bytes(pending), final=True)
         return 0
     finally:
         stopped.set()
 
 
-async def _run_input(port: int) -> int:
+async def _run_input(port: int, encoding: str) -> int:
     async with InputClient(port) as client:
-        sending = asyncio.create_task(_send_stdin_lines(client))
+        sending = asyncio.create_task(_send_stdin_lines(client, encoding))
         disconnected = asyncio.create_task(client.wait_for_disconnect())
         try:
             done, _ = await asyncio.wait((sending, disconnected), return_when=asyncio.FIRST_COMPLETED)
@@ -226,7 +269,7 @@ async def _run_console(args: argparse.Namespace, ports: Ports) -> int:
             local_input = None
             try:
                 if not args.no_local_stdin:
-                    local_input = _start_local_input(supervisor, args.close_stdin_on_eof)
+                    local_input = _start_local_input(supervisor, args.close_stdin_on_eof, args.encoding)
                 return await supervisor.wait()
             finally:
                 if local_input is not None:
@@ -237,6 +280,7 @@ async def _run_console(args: argparse.Namespace, ports: Ports) -> int:
 def _encoding(value: str) -> str:
     try:
         decoder = codecs.getincrementaldecoder(value)
+        codecs.getincrementalencoder(value)
         if not isinstance(decoder("replace").decode(b""), str):
             raise ValueError(f"{value!r} is not a text encoding")
         "".encode(value)
@@ -272,7 +316,7 @@ def _configure_run(parser: argparse.ArgumentParser, defaults: Ports) -> None:
     parser.add_argument("--close-stdin-on-eof", action="store_true",
                         help="close child stdin on EOF from a TCP or local input source")
     parser.add_argument("--encoding", type=_encoding, default="utf-8",
-                        help="text encoding for GUI and Windows console output (default: utf-8)")
+                        help="child text encoding for terminal and GUI I/O (default: %(default)s)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
 
 
@@ -307,16 +351,18 @@ def main(argv: list[str] | None = None) -> int:
     panel.add_argument("--port", type=_client_port, default=defaults.stdout,
                        help="framed output port (default: %(default)s)")
     panel.add_argument("--encoding", type=_encoding, default="utf-8",
-                       help="text encoding for Windows console output (default: %(default)s)")
+                       help="child text encoding for terminal output (default: %(default)s)")
     input_parser = commands.add_parser("input", help="send local stdin lines to a running command")
     input_parser.add_argument("--port", type=_client_port, default=defaults.stdin,
                               help="stdin port (default: %(default)s)")
+    input_parser.add_argument("--encoding", type=_encoding, default="utf-8",
+                              help="child text encoding for terminal input (default: %(default)s)")
     args = parser.parse_args(argv)
     try:
         if args.action == "panel":
             return asyncio.run(_run_panel(args.port, args.encoding))
         if args.action == "input":
-            return asyncio.run(_run_input(args.port))
+            return asyncio.run(_run_input(args.port, args.encoding))
         ports = _parse_run_ports(run, args, defaults)
         if args.gui:
             try:
