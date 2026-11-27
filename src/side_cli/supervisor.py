@@ -15,6 +15,8 @@ from enum import StrEnum
 from types import TracebackType
 from typing import Literal
 
+from .terminal import TerminalProcess, open_terminal
+
 HOST = "127.0.0.1"
 CHUNK_SIZE = 64 * 1024
 CLIENT_BUFFER_LIMIT = 4 * 1024 * 1024
@@ -51,9 +53,11 @@ class Ports:
         if len(set(fixed)) != len(fixed):
             raise ValueError("active TCP listeners must use different ports")
 
-    def _bindings(self) -> dict[Endpoint, int]:
+    def _bindings(self, terminal: bool = False) -> dict[Endpoint, int]:
         if self.output is not None:
             return {Stream.STDIN: self.stdin, "output": self.output}
+        if terminal:
+            return {Stream.STDIN: self.stdin, Stream.STDOUT: self.stdout}
         return {Stream.STDIN: self.stdin, Stream.STDOUT: self.stdout, Stream.STDERR: self.stderr}
 
 
@@ -109,7 +113,7 @@ def _piped_environment(
 
 
 class Supervisor:
-    """Run one command with piped standard streams on the current asyncio loop."""
+    """Run one command with pipes or a terminal on the current asyncio loop."""
 
     def __init__(
         self,
@@ -122,11 +126,15 @@ class Supervisor:
         close_stdin_on_eof: bool = False,
         cwd: str | os.PathLike[str] | None = None,
         env: Mapping[str, str] | None = None,
+        terminal_size: tuple[int, int] | None = None,
     ) -> None:
         if isinstance(command, str) or not command or not command[0]:
             raise ValueError("command must be a nonempty argument sequence")
         self.command = tuple(command)
-        self._port_bindings = ports._bindings()
+        if terminal_size is not None and close_stdin_on_eof:
+            raise ValueError("terminal input cannot be closed independently of terminal output")
+        self._terminal_size = terminal_size
+        self._port_bindings = ports._bindings(terminal_size is not None)
         self._merged_output = ports.output is not None
         self._bound_ports: dict[Endpoint, int] = {}
         self._servers: dict[Endpoint, asyncio.Server] = {}
@@ -138,6 +146,7 @@ class Supervisor:
         self._started = asyncio.Event()
         self._stdin_lock = asyncio.Lock()
         self._process: asyncio.subprocess.Process | None = None
+        self._terminal: TerminalProcess | None = None
         self._completion: asyncio.Task[int] | None = None
         self._on_output = on_output
         self._on_input_echo = on_input_echo
@@ -161,14 +170,18 @@ class Supervisor:
 
     @property
     def pid(self) -> int | None:
-        return None if self._process is None else self._process.pid
+        child = self._terminal or self._process
+        return None if child is None else child.pid
 
     @property
     def returncode(self) -> int | None:
-        return None if self._process is None else self._process.returncode
+        child = self._terminal or self._process
+        return None if child is None else child.returncode
 
     @property
     def stdin_open(self) -> bool:
+        if self._terminal is not None:
+            return self._terminal.returncode is None and not self._closed
         return (
             self._process is not None
             and self._process.returncode is None
@@ -226,24 +239,30 @@ class Supervisor:
 
     async def start(self) -> None:
         """Bind the listeners if necessary and launch the command without a shell."""
-        if self._process is not None:
+        if self.pid is not None:
             raise RuntimeError("the command has already been started")
         await self.listen()
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                *self.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self._cwd,
-                env=_piped_environment(self.command[0], self._env),
-                start_new_session=os.name == "posix",
-            )
+            if self._terminal_size is not None:
+                self._terminal = await open_terminal(
+                    self.command, self._terminal_size, cwd=self._cwd, env=self._env,
+                )
+                self._completion = asyncio.create_task(self._run_terminal(self._terminal))
+            else:
+                self._process = await asyncio.create_subprocess_exec(
+                    *self.command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self._cwd,
+                    env=_piped_environment(self.command[0], self._env),
+                    start_new_session=os.name == "posix",
+                )
+                self._completion = asyncio.create_task(self._run(self._process))
         except BaseException:
             await self.aclose()
             raise
         self._started.set()
-        self._completion = asyncio.create_task(self._run(self._process))
 
     async def wait(self) -> int:
         """Return the child's exit code after draining stdout and stderr."""
@@ -254,8 +273,12 @@ class Supervisor:
     async def send(self, data: bytes) -> None:
         """Write bytes to the child's stdin, or raise BrokenPipeError if closed."""
         async with self._stdin_lock:
-            if not self.stdin_open or self._process is None:
+            if not self.stdin_open:
                 raise BrokenPipeError("child stdin is not open")
+            if self._terminal is not None:
+                await self._terminal.write(data)
+                return
+            assert self._process is not None
             writer = self._process.stdin
             assert writer is not None
             writer.write(data)
@@ -263,14 +286,30 @@ class Supervisor:
 
     async def close_stdin(self) -> None:
         """Send EOF to the child after all preceding writes."""
+        if self._terminal_size is not None:
+            raise RuntimeError("terminal input cannot be closed independently of terminal output")
         async with self._stdin_lock:
             if self._process is not None and self._process.stdin is not None:
                 self._process.stdin.close()
 
+    def resize_terminal(self, columns: int, rows: int) -> None:
+        """Resize a running terminal, or set its initial size before launch."""
+        if self._terminal_size is None:
+            raise RuntimeError("not running in terminal mode")
+        self._terminal_size = (columns, rows)
+        if self._terminal is not None and self.stdin_open:
+            self._terminal.resize(columns, rows)
+
     def forward_console_interrupt(self) -> None:
-        """Relay a terminal interrupt on POSIX; Windows delivers it natively."""
+        """Relay a console interrupt if the child does not receive it natively."""
         if os.name == "posix":
             self._stop(signal.SIGINT)
+        elif self._terminal is not None:
+            async def interrupt() -> None:
+                with suppress(OSError):
+                    await self.send(b"\x03")
+
+            asyncio.get_running_loop().create_task(interrupt())
 
     def terminate(self) -> None:
         """Terminate the child (and its process group on POSIX)."""
@@ -296,6 +335,9 @@ class Supervisor:
         await self._close_network()
 
     def _stop(self, signum: int) -> None:
+        if self._terminal is not None:
+            self._terminal.stop(signum)
+            return
         if self._process is None:
             return
         with suppress(ProcessLookupError):
@@ -318,23 +360,40 @@ class Supervisor:
             await self._close_network()
 
     async def _pump(self, stream: Stream, reader: asyncio.StreamReader) -> None:
+        while data := await reader.read(CHUNK_SIZE):
+            await self._publish(stream, data)
+
+    async def _run_terminal(self, terminal: TerminalProcess) -> int:
+        try:
+            while data := await terminal.read(CHUNK_SIZE):
+                await self._publish(Stream.STDOUT, data)
+            return await terminal.wait()
+        except BaseException:
+            terminal.stop(signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
+            raise
+        finally:
+            try:
+                await self._close_network()
+            finally:
+                terminal.close()
+
+    async def _publish(self, stream: Stream, data: bytes) -> None:
         endpoint: Endpoint = "output" if self._merged_output else stream
         clients = self._clients[endpoint]
-        while data := await reader.read(CHUNK_SIZE):
-            if clients:
-                packet = data
-                if self._merged_output:
-                    packet = _FRAME_HEADER.pack(_OUTPUT_STREAM_IDS[stream], len(data)) + data
-                for writer in tuple(clients):
-                    if writer.is_closing():
-                        continue
-                    writer.write(packet)
-                    if writer.transport.get_write_buffer_size() > CLIENT_BUFFER_LIMIT:
-                        writer.transport.abort()
-            if self._on_output is not None:
-                result = self._on_output(stream, data)
-                if inspect.isawaitable(result):
-                    await result
+        if clients:
+            packet = data
+            if self._merged_output:
+                packet = _FRAME_HEADER.pack(_OUTPUT_STREAM_IDS[stream], len(data)) + data
+            for writer in tuple(clients):
+                if writer.is_closing():
+                    continue
+                writer.write(packet)
+                if writer.transport.get_write_buffer_size() > CLIENT_BUFFER_LIMIT:
+                    writer.transport.abort()
+        if self._on_output is not None:
+            result = self._on_output(stream, data)
+            if inspect.isawaitable(result):
+                await result
 
     def _connect(
         self, endpoint: Endpoint, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -364,6 +423,11 @@ class Supervisor:
             writer.close()
 
     async def _serve_input(self, reader: asyncio.StreamReader) -> None:
+        if self._terminal_size is not None:
+            while data := await reader.read(CHUNK_SIZE):
+                await self._started.wait()
+                await self.send(data)
+            return
         lines = _InputLines()
         decoder = self._input_decoder("replace") if self._input_decoder is not None else None
 

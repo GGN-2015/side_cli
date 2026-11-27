@@ -14,6 +14,7 @@ from contextlib import suppress
 from typing import BinaryIO, TextIO
 
 from .clients import InputClient, PanelClient
+from .local_terminal import LocalTerminal, terminal_size
 from .supervisor import CHUNK_SIZE, Ports, Stream, Supervisor, _InputLines
 
 _ECHO_CONTROLS = dict.fromkeys(
@@ -148,7 +149,7 @@ def _start_local_input(
 
 
 class ConsoleOutput:
-    def __init__(self, encoding: str) -> None:
+    def __init__(self, encoding: str, *, raw: bool = False) -> None:
         self.sinks = {}
         self.transcoders: dict[Stream, _Transcoder] = {}
         self._stdout_lock = asyncio.Lock()
@@ -156,9 +157,9 @@ class ConsoleOutput:
         for stream, file in ((Stream.STDOUT, sys.stdout), (Stream.STDERR, sys.stderr)):
             binary = getattr(file, "buffer", None)
             if binary is not None:
-                raw = getattr(binary, "raw", binary)
-                self.sinks[stream] = raw
-                if target := _terminal_encoding(file, raw):
+                sink = getattr(binary, "raw", binary)
+                self.sinks[stream] = sink
+                if not raw and (target := _terminal_encoding(file, sink)):
                     self.transcoders[stream] = _Transcoder(encoding, target)
                     if stream is Stream.STDOUT:
                         self._stdout_encoding = target
@@ -312,6 +313,44 @@ async def _run_console(args: argparse.Namespace, ports: Ports) -> int:
                 await output.finish()
 
 
+async def _run_terminal_console(args: argparse.Namespace, ports: Ports) -> int:
+    output = ConsoleOutput("utf-8", raw=os.name != "nt")
+    size = terminal_size() or (80, 24)
+    supervisor = Supervisor(args.command, ports=ports, on_output=output.write, terminal_size=size)
+
+    async def follow_size() -> None:
+        current = size
+        while True:
+            if (updated := terminal_size()) and updated != current:
+                supervisor.resize_terminal(*updated)
+                current = updated
+            await asyncio.sleep(0.1)
+
+    with ConsoleInterrupt(supervisor) as interrupts:
+        async with supervisor:
+            if args.show_ports:
+                show_ports(supervisor)
+            if not await interrupts.launch(args.wait_for_output_clients):
+                return 130
+            with LocalTerminal(local_input=not args.no_local_stdin) as terminal:
+                terminal.start_input(supervisor.send)
+                resize = asyncio.create_task(follow_size())
+                completion = asyncio.create_task(supervisor.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        (resize, completion),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if resize in done:
+                        resize.result()
+                    return completion.result()
+                finally:
+                    resize.cancel()
+                    completion.cancel()
+                    await asyncio.gather(resize, completion, return_exceptions=True)
+                    await output.finish()
+
+
 def _encoding(value: str) -> str:
     try:
         decoder = codecs.getincrementaldecoder(value)
@@ -335,7 +374,12 @@ def _client_port(value: str) -> int:
 
 
 def _configure_run(parser: argparse.ArgumentParser, defaults: Ports) -> None:
-    parser.add_argument("--gui", action="store_true", help="open the desktop interface")
+    parser.add_argument("--gui", action="store_true", help="open the desktop interface for pipes or a terminal")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--terminal", "--pty", action="store_true", default=None,
+                      help="use an interactive pseudo-terminal (automatic for bare codex)")
+    mode.add_argument("--pipes", dest="terminal", action="store_false",
+                      help="use separate pipes even for bare codex")
     parser.add_argument("--stdin-port", type=int, default=defaults.stdin,
                         help="TCP port for stdin (default: %(default)s; 0: auto)")
     for stream in (Stream.STDOUT, Stream.STDERR):
@@ -360,13 +404,21 @@ def _parse_run_ports(parser: argparse.ArgumentParser, args: argparse.Namespace, 
         del args.command[0]
     if not args.command or not args.command[0]:
         parser.error("a command is required")
+    if args.terminal is None:
+        executable = os.path.basename(args.command[0]).casefold()
+        args.terminal = len(args.command) == 1 and executable in {"codex", "codex.exe"}
+    if args.terminal:
+        if args.close_stdin_on_eof or args.stderr_port is not None:
+            parser.error("--terminal cannot be combined with --close-stdin-on-eof or --stderr-port")
+        if codecs.lookup(args.encoding).name != "utf-8":
+            parser.error("--terminal does not transcode; --encoding must be UTF-8")
     if args.output_port is not None and (args.stdout_port is not None or args.stderr_port is not None):
         parser.error("--output-port cannot be combined with --stdout-port or --stderr-port")
     try:
         return Ports(
             stdin=args.stdin_port,
             stdout=defaults.stdout if args.stdout_port is None else args.stdout_port,
-            stderr=defaults.stderr if args.stderr_port is None else args.stderr_port,
+            stderr=0 if args.terminal else defaults.stderr if args.stderr_port is None else args.stderr_port,
             output=args.output_port,
         )
     except ValueError as error:
@@ -401,7 +453,15 @@ def main(argv: list[str] | None = None) -> int:
                 input_parser.error("--encoding must use a single LF byte for newlines")
             return asyncio.run(_run_input(args.port, args.encoding))
         ports = _parse_run_ports(run, args, defaults)
-        if args.gui:
+        if args.gui and args.terminal:
+            try:
+                from .terminal_gui import run_terminal_gui
+            except ImportError as error:
+                raise RuntimeError(f"terminal GUI requires Qt WebEngine: {error}") from error
+            code = asyncio.run(run_terminal_gui(args, ports))
+        elif args.terminal:
+            code = asyncio.run(_run_terminal_console(args, ports))
+        elif args.gui:
             try:
                 from .gui import run_gui
             except ImportError as error:

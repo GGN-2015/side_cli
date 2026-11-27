@@ -1,14 +1,15 @@
 # side-cli
 
-Run a command with piped standard streams and bridge them to local TCP ports.
-Use the console, the Tk desktop window, or the async Python API. Receive
-stdout and stderr on separate ports or on one framed output port.
+Run a command and bridge its pipes or interactive terminal to local TCP ports.
+Use the console, the Tk desktop window, or the async Python API.
 
 ## Quick start
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run
 these commands from the project directory. The project requires Python 3.11
-or later and has no third-party runtime dependencies.
+or later. On Windows, `uv` installs `pywinpty` for ConPTY support.
+The Windows and Linux project environments also include Qt WebEngine for
+the embedded terminal.
 
 ```shell
 uv sync --locked
@@ -41,7 +42,49 @@ the window stops a command that is still running. GUI mode requires Tkinter
 and a desktop session; run `uv run python -m tkinter` to check. If you use the
 system Python on Debian or Ubuntu, install its `python3-tk` package if needed.
 
+## Interactive terminal
+
+Run this in a terminal on Windows (with ConPTY support) or Linux:
+
+```shell
+uv run side-cli run -- codex
+uv run side-cli run --terminal -- codex resume
+```
+
+To open the interactive terminal **in a desktop window** instead:
+
+```shell
+uv run side-cli run --gui -- codex
+uv run side-cli run --gui --terminal -- codex resume
+```
+
+Type directly in the terminal area. Arrow keys, `Ctrl+C`, and full-screen
+terminal rendering work there. Use `Ctrl+Shift+C` to copy selected text and
+`Ctrl+Shift+V` to paste. The status bar shows the process and TCP listeners;
+closing the window stops the child. The embedded terminal requires a Windows
+or Linux desktop session and the Qt WebEngine system libraries on Linux.
+Plain `--gui` with a non-terminal command still opens the Tk log window.
+
+Bare `codex` (or `codex.exe`) automatically gets a pseudo-terminal. Use
+`--terminal` (alias `--pty`) for other interactive commands or when passing
+Codex arguments. Other commands default to pipes; `--pipes` forces that mode.
+On Windows, pass a native executable; to run a batch file, invoke `cmd.exe`
+explicitly.
+
+The child sees a terminal on all three standard streams. Local keystrokes
+are relayed immediately, including arrow keys and Ctrl+C, and the PTY follows
+the local terminal's size. There is no separate stderr stream in a terminal:
+the combined display goes to the raw stdout port, or to `--output-port` as
+stream ID `1`. It includes cursor and screen-control sequences. The stdin TCP
+port accepts raw terminal input without waiting for LF; send `\r` for Enter.
+ConPTY input and output use UTF-8. `--no-local-stdin` leaves TCP as the only
+input source. Terminal mode does not support `--stderr-port` or
+`--close-stdin-on-eof`. Use pipe mode for machine-readable output, for example
+with `codex exec`.
+
 ## TCP and process behavior
+
+The following describes pipe mode.
 
 | Stream | Default address | Direction |
 | --- | --- | --- |
@@ -213,6 +256,10 @@ The `stdout` and `stderr` port settings apply only in separate-port mode.
 Call `listen()` directly if you need to bind before starting without a context
 manager, and use `aclose()` to clean up. An embedding app owns its own signal
 handlers. On Windows, use the default asyncio Proactor event loop.
+Pass `terminal_size=(columns, rows)` to `Supervisor` to use a PTY instead of
+pipes, and call `resize_terminal(columns, rows)` to update its size. In this
+mode `send()` writes terminal input and the full display is delivered as
+`Stream.STDOUT`; `close_stdin()` is not supported.
 
 ### TCP clients
 
