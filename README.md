@@ -100,6 +100,34 @@ input source. Terminal mode does not support `--stderr-port` or
 `--close-stdin-on-eof`. Use pipe mode for machine-readable output, for example
 with `codex exec`.
 
+### Mirror an interactive session
+
+Open the terminal and the panel in separate processes:
+
+```shell
+uv run side-cli run --gui --events-port 8768 -- codex
+uv run side-cli panel --terminal --port 8768
+```
+
+The panel is read-only. It replays the terminal from the beginning and then
+follows live changes, including cursor movement, screen switches and resizes.
+It keeps the source terminal's grid size; use the panel's scrollbars if the
+window is smaller. Without `--terminal`, `panel` still shows the existing
+framed output stream. Event viewers do not count toward
+`--wait-for-output-clients`, which still waits on the raw or framed output ports.
+
+Lines submitted in the terminal GUI appear separately from the screen. To
+submit whole lines over TCP as well, add `--line-input-port 8769` to `run`, then
+use `uv run side-cli input --port 8769`. This port accepts one UTF-8 line per
+LF or CRLF and sends terminal Enter for each line. The ordinary stdin TCP
+port remains raw: it and the terminal keyboard do not generate line events.
+
+The opt-in event port is loopback-only and unauthenticated. Other local
+processes that connect can see the screen and explicitly submitted lines.
+The session is replayed from a temporary file that grows with its output and
+submitted lines and is removed when the session ends. Do not enable mirroring
+for sessions that contain secrets.
+
 ## TCP and process behavior
 
 The following describes pipe mode.

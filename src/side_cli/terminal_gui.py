@@ -9,7 +9,7 @@ import os
 from contextlib import suppress
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Property, Qt, QUrl, Signal, Slot
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from .cli import ConsoleInterrupt, show_ports
+from .events import is_terminal_line
 from .supervisor import INPUT_LINE_LIMIT, Ports, Stream, Supervisor
 
 _CONPTY_UNSUPPORTED_REPLIES = ("\x1b]10;rgb:", "\x1b]11;rgb:", "\x1b]12;rgb:")
@@ -39,7 +40,14 @@ class TerminalBridge(QObject):
         self.input: asyncio.Queue[tuple[bytes, bool]] = asyncio.Queue(maxsize=256)
         self.error: str | None = None
         self.closed = False
-        self.bracketed_paste = False
+
+    @Property(bool, constant=True)
+    def read_only(self) -> bool:
+        return False
+
+    @property
+    def bracketed_paste(self) -> bool:
+        return self.supervisor.bracketed_paste
 
     def close(self) -> None:
         self.closed = True
@@ -86,13 +94,11 @@ class TerminalBridge(QObject):
         return True
 
     def queue_line(self, data: bytes) -> bool:
-        if data and self.bracketed_paste:
-            data = b"\x1b[200~" + data + b"\x1b[201~"
         return self.queue_input(data, submit=True)
 
     @Slot(bool)
     def acknowledge_output(self, bracketed_paste: bool) -> None:
-        self.bracketed_paste = bracketed_paste
+        self.supervisor.bracketed_paste = bracketed_paste
         self.rendered.set()
 
     @Slot(str)
@@ -134,6 +140,18 @@ class TerminalPage(QWebEnginePage):
         return main_frame and url == self.document
 
 
+class TerminalView(QWebEngineView):
+    def __init__(self, bridge: QObject, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.document = QUrl.fromLocalFile(str(Path(__file__).with_name("terminal_assets") / "index.html"))
+        page = TerminalPage(self.document, self)
+        channel = QWebChannel(page)
+        channel.registerObject("bridge", bridge)
+        page.setWebChannel(channel)
+        self.setPage(page)
+
+
 class TerminalWindow(QMainWindow):
     def __init__(self, bridge: TerminalBridge) -> None:
         super().__init__()
@@ -147,14 +165,7 @@ class TerminalWindow(QMainWindow):
         self.process_status.setTextFormat(Qt.TextFormat.PlainText)
         self.statusBar().addWidget(self.process_status, 1)
 
-        self.view = QWebEngineView(self)
-        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        document = QUrl.fromLocalFile(str(Path(__file__).with_name("terminal_assets") / "index.html"))
-        page = TerminalPage(document, self.view)
-        channel = QWebChannel(page)
-        channel.registerObject("bridge", bridge)
-        page.setWebChannel(channel)
-        self.view.setPage(page)
+        self.view = TerminalView(bridge, self)
         self.view.loadFinished.connect(self.page_loaded)
         self.view.renderProcessTerminated.connect(self.renderer_stopped)
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -164,7 +175,7 @@ class TerminalWindow(QMainWindow):
         split.setStretchFactor(0, 1)
         split.setSizes([860, 320])
         self.setCentralWidget(split)
-        self.view.load(document)
+        self.view.load(self.view.document)
 
     def build_sidebar(self) -> QWidget:
         sidebar = QWidget()
@@ -230,7 +241,7 @@ class TerminalWindow(QMainWindow):
         if not self.bridge.accepts_input:
             return
         text = self.line_entry.text()
-        if any(ord(char) < 32 or 127 <= ord(char) <= 159 or char in "\u2028\u2029" for char in text):
+        if not is_terminal_line(text):
             self.input_status.setText("Enter a single line without control characters.")
             return
         line = self.pending_line + text

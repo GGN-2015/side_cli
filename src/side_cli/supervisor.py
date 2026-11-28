@@ -15,14 +15,15 @@ from enum import StrEnum
 from types import TracebackType
 from typing import Literal
 
+from .events import Event, LineSource, MAX_LINE_BYTES, TerminalJournal, is_terminal_line
 from .terminal import TerminalProcess, open_terminal
 
 HOST = "127.0.0.1"
 CHUNK_SIZE = 64 * 1024
 CLIENT_BUFFER_LIMIT = 4 * 1024 * 1024
-INPUT_LINE_LIMIT = 1024 * 1024
+INPUT_LINE_LIMIT = MAX_LINE_BYTES
 SHUTDOWN_TIMEOUT = 2.0
-_CONPTY_ENTER_DELAY = 0.2
+_TERMINAL_ENTER_DELAY = 0.35 if os.name == "nt" else 0.2
 
 
 class Stream(StrEnum):
@@ -31,7 +32,7 @@ class Stream(StrEnum):
     STDERR = "stderr"
 
 
-Endpoint = Stream | Literal["output"]
+Endpoint = Stream | Literal["output", "events", "line-input"]
 _FRAME_HEADER = struct.Struct("!BI")
 _OUTPUT_STREAM_IDS = {Stream.STDOUT: 1, Stream.STDERR: 2}
 _CLINK_PROMPT_TAG = "C\bL\bI\bN\bK\b \b"
@@ -45,6 +46,8 @@ class Ports:
     stdout: int = 8766
     stderr: int = 8767
     output: int | None = None
+    events: int | None = None
+    line_input: int | None = None
 
     def __post_init__(self) -> None:
         ports = self._bindings().values()
@@ -55,11 +58,18 @@ class Ports:
             raise ValueError("active TCP listeners must use different ports")
 
     def _bindings(self, terminal: bool = False) -> dict[Endpoint, int]:
+        bindings: dict[Endpoint, int] = {Stream.STDIN: self.stdin}
         if self.output is not None:
-            return {Stream.STDIN: self.stdin, "output": self.output}
-        if terminal:
-            return {Stream.STDIN: self.stdin, Stream.STDOUT: self.stdout}
-        return {Stream.STDIN: self.stdin, Stream.STDOUT: self.stdout, Stream.STDERR: self.stderr}
+            bindings["output"] = self.output
+        else:
+            bindings[Stream.STDOUT] = self.stdout
+            if not terminal:
+                bindings[Stream.STDERR] = self.stderr
+        if self.events is not None:
+            bindings["events"] = self.events
+        if self.line_input is not None:
+            bindings["line-input"] = self.line_input
+        return bindings
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,9 +144,14 @@ class Supervisor:
         self.command = tuple(command)
         if terminal_size is not None and close_stdin_on_eof:
             raise ValueError("terminal input cannot be closed independently of terminal output")
+        if terminal_size is None and (ports.events is not None or ports.line_input is not None):
+            raise ValueError("the events and line input ports require terminal mode")
         self._terminal_size = terminal_size
         self._port_bindings = ports._bindings(terminal_size is not None)
         self._merged_output = ports.output is not None
+        self._journal: TerminalJournal | None = None
+        self._event_tasks: set[asyncio.Task[None]] = set()
+        self.bracketed_paste = False
         self._bound_ports: dict[Endpoint, int] = {}
         self._servers: dict[Endpoint, asyncio.Server] = {}
         self._clients: dict[Endpoint, set[asyncio.StreamWriter]] = {
@@ -210,6 +225,8 @@ class Supervisor:
         if self._servers:
             return
         try:
+            if "events" in self._port_bindings:
+                self._journal = TerminalJournal()
             for endpoint, port in self._port_bindings.items():
                 def connected(
                     reader: asyncio.StreamReader,
@@ -232,7 +249,10 @@ class Supervisor:
     async def wait_for_output_clients(self) -> None:
         """Wait until each output port has at least one connected reader."""
         while self._servers:
-            if all(clients for endpoint, clients in self._clients.items() if endpoint is not Stream.STDIN):
+            if all(
+                clients for endpoint, clients in self._clients.items()
+                if endpoint in (Stream.STDOUT, Stream.STDERR, "output")
+            ):
                 return
             self._connections_changed.clear()
             await self._connections_changed.wait()
@@ -245,10 +265,17 @@ class Supervisor:
         await self.listen()
         try:
             if self._terminal_size is not None:
+                size = self._terminal_size
+                if self._journal is not None:
+                    self._journal.resize(*size)
                 self._terminal = await open_terminal(
-                    self.command, self._terminal_size, cwd=self._cwd, env=self._env,
+                    self.command, size, cwd=self._cwd, env=self._env,
                 )
                 self._completion = asyncio.create_task(self._run_terminal(self._terminal))
+                if self._terminal_size != size:
+                    self._terminal.resize(*self._terminal_size)
+                    if self._journal is not None:
+                        self._journal.resize(*self._terminal_size)
             else:
                 self._process = await asyncio.create_subprocess_exec(
                     *self.command,
@@ -285,16 +312,19 @@ class Supervisor:
             writer.write(data)
             await writer.drain()
 
-    async def send_terminal_line(self, data: bytes) -> None:
-        """Submit text and Enter as one input, pacing the Enter key on ConPTY."""
+    async def send_terminal_line(self, data: bytes, *, source: LineSource = LineSource.GUI) -> None:
+        """Submit text and Enter without interleaving another writer."""
         async with self._stdin_lock:
             if self._terminal is None or not self.stdin_open:
                 raise BrokenPipeError("child terminal is not open")
-            if os.name == "nt" and data:
-                await self._terminal.write(data)
-                await asyncio.sleep(_CONPTY_ENTER_DELAY)
-                data = b""
-            await self._terminal.write(data + b"\r")
+            payload = b"\x1b[200~" + data + b"\x1b[201~" if data and self.bracketed_paste else data
+            if payload and (os.name == "nt" or not self.bracketed_paste):
+                await self._terminal.write(payload)
+                await asyncio.sleep(_TERMINAL_ENTER_DELAY)
+                payload = b""
+            await self._terminal.write(payload + b"\r")
+            if self._journal is not None and not self._journal.finished:
+                self._journal.append(Event.LINE, bytes([source]) + data)
 
     async def close_stdin(self, *, final_data: bytes = b"") -> None:
         """Write optional final bytes and send EOF after all preceding writes."""
@@ -314,9 +344,13 @@ class Supervisor:
         """Resize a running terminal, or set its initial size before launch."""
         if self._terminal_size is None:
             raise RuntimeError("not running in terminal mode")
-        self._terminal_size = (columns, rows)
+        if self._terminal_size == (columns, rows):
+            return
         if self._terminal is not None and self.stdin_open:
             self._terminal.resize(columns, rows)
+            if self._journal is not None:
+                self._journal.resize(columns, rows)
+        self._terminal_size = (columns, rows)
 
     def forward_console_interrupt(self) -> None:
         """Relay a console interrupt if the child does not receive it natively."""
@@ -385,7 +419,11 @@ class Supervisor:
         try:
             while data := await terminal.read(CHUNK_SIZE):
                 await self._publish(Stream.STDOUT, data)
-            return await terminal.wait()
+            code = await terminal.wait()
+            if self._journal is not None:
+                async with self._stdin_lock:
+                    self._journal.finish(code)
+            return code
         except BaseException:
             terminal.stop(signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
             raise
@@ -396,6 +434,8 @@ class Supervisor:
                 terminal.close()
 
     async def _publish(self, stream: Stream, data: bytes) -> None:
+        if self._journal is not None:
+            self._journal.append(Event.DATA, data)
         endpoint: Endpoint = "output" if self._merged_output else stream
         clients = self._clients[endpoint]
         if clients:
@@ -421,16 +461,27 @@ class Supervisor:
             return
         self._clients[endpoint].add(writer)
         self._connections_changed.set()
-        task = asyncio.create_task(self._serve_client(endpoint, reader, writer))
+        task = asyncio.create_task(self._serve_client(endpoint, reader, writer, self._journal))
         self._client_tasks.add(task)
         task.add_done_callback(self._client_tasks.discard)
+        if endpoint == "events":
+            self._event_tasks.add(task)
+            task.add_done_callback(self._event_tasks.discard)
 
     async def _serve_client(
-        self, endpoint: Endpoint, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self, endpoint: Endpoint, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        journal: TerminalJournal | None,
     ) -> None:
         try:
             if endpoint is Stream.STDIN:
                 await self._serve_input(reader)
+                return
+            if endpoint == "line-input":
+                await self._serve_terminal_lines(reader)
+                return
+            if endpoint == "events":
+                assert journal is not None
+                await journal.serve(reader, writer)
                 return
             while await reader.read(CHUNK_SIZE):
                 pass
@@ -439,6 +490,21 @@ class Supervisor:
         finally:
             self._clients[endpoint].discard(writer)
             writer.close()
+
+    async def _serve_terminal_lines(self, reader: asyncio.StreamReader) -> None:
+        lines = _InputLines()
+        while data := await reader.read(CHUNK_SIZE):
+            for line in lines.feed(data):
+                payload = line.removesuffix(b"\n").removesuffix(b"\r")
+                text = payload.decode("utf-8")
+                if not is_terminal_line(text):
+                    raise ValueError("expected a single terminal line without control characters")
+                await self._started.wait()
+                await self.send_terminal_line(payload, source=LineSource.TCP)
+                if self._on_input_echo is not None:
+                    result = self._on_input_echo(text + "\n")
+                    if inspect.isawaitable(result):
+                        await result
 
     async def _serve_input(self, reader: asyncio.StreamReader) -> None:
         decoder = self._input_decoder("replace") if self._input_decoder is not None else None
@@ -470,17 +536,30 @@ class Supervisor:
             await self.close_stdin()
 
     async def _close_network(self) -> None:
+        journal, self._journal = self._journal, None
         servers = tuple(self._servers.values())
-        if not servers:
+        if not servers and journal is None:
             return
         self._servers.clear()
         self._connections_changed.set()
         for server in servers:
             server.close()
+        try:
+            if journal is not None and journal.finished and self._event_tasks:
+                await asyncio.wait(tuple(self._event_tasks), timeout=SHUTDOWN_TIMEOUT)
+        finally:
+            try:
+                await self._close_clients(servers)
+            finally:
+                if journal is not None:
+                    journal.close()
+
+    async def _close_clients(self, servers: tuple[asyncio.Server, ...]) -> None:
         writers = [writer for clients in self._clients.values() for writer in clients]
         for clients in self._clients.values():
             clients.clear()
-        for task in tuple(self._client_tasks):
+        tasks = tuple(self._client_tasks)
+        for task in tasks:
             task.cancel()
         for writer in writers:
             writer.close()
@@ -489,6 +568,7 @@ class Supervisor:
                 await asyncio.gather(
                     *(writer.wait_closed() for writer in writers),
                     *(server.wait_closed() for server in servers),
+                    *tasks,
                     return_exceptions=True,
                 )
         except TimeoutError:

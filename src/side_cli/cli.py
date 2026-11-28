@@ -387,6 +387,10 @@ def _configure_run(parser: argparse.ArgumentParser, defaults: Ports) -> None:
                             help=f"TCP port for {stream} (default: {getattr(defaults, stream)}; 0: auto)")
     parser.add_argument("--output-port", type=int,
                         help="one TCP port for framed stdout and stderr (replaces both output ports; 0: auto)")
+    parser.add_argument("--events-port", type=int,
+                        help="read-only TCP event port for terminal panels (0: auto)")
+    parser.add_argument("--line-input-port", type=int,
+                        help="TCP port for submitting UTF-8 lines to a terminal (0: auto)")
     parser.add_argument("--show-ports", action="store_true", help="print bound ports to stderr")
     parser.add_argument("--wait-for-output-clients", action="store_true",
                         help="wait for a client on each output port before launching")
@@ -412,6 +416,8 @@ def _parse_run_ports(parser: argparse.ArgumentParser, args: argparse.Namespace, 
             parser.error("--terminal cannot be combined with --close-stdin-on-eof or --stderr-port")
         if codecs.lookup(args.encoding).name != "utf-8":
             parser.error("--terminal does not transcode; --encoding must be UTF-8")
+    elif args.events_port is not None or args.line_input_port is not None:
+        parser.error("--events-port and --line-input-port require terminal mode")
     if args.output_port is not None and (args.stdout_port is not None or args.stderr_port is not None):
         parser.error("--output-port cannot be combined with --stdout-port or --stderr-port")
     try:
@@ -420,6 +426,8 @@ def _parse_run_ports(parser: argparse.ArgumentParser, args: argparse.Namespace, 
             stdout=defaults.stdout if args.stdout_port is None else args.stdout_port,
             stderr=0 if args.terminal else defaults.stderr if args.stderr_port is None else args.stderr_port,
             output=args.output_port,
+            events=args.events_port,
+            line_input=args.line_input_port,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -434,9 +442,10 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="run and supervise a command",
                               usage="%(prog)s [options] -- command [arguments ...]")
     _configure_run(run, defaults)
-    panel = commands.add_parser("panel", help="mirror stdout and stderr from a framed output port")
-    panel.add_argument("--port", type=_client_port, default=defaults.stdout,
-                       help="framed output port (default: %(default)s)")
+    panel = commands.add_parser("panel", help="show framed logs or mirror an interactive terminal")
+    panel.add_argument("--terminal", action="store_true", help="open a read-only terminal mirror")
+    panel.add_argument("--port", type=_client_port,
+                       help="TCP port (default: 8766 for logs, 8768 for terminal events)")
     panel.add_argument("--encoding", type=_encoding, default="utf-8",
                        help="child text encoding for terminal output (default: %(default)s)")
     input_parser = commands.add_parser("input", help="send local stdin lines to a running command")
@@ -447,7 +456,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.action == "panel":
-            return asyncio.run(_run_panel(args.port, args.encoding))
+            if args.terminal:
+                if codecs.lookup(args.encoding).name != "utf-8":
+                    panel.error("--terminal requires UTF-8")
+                try:
+                    from .panel_gui import run_terminal_panel
+                except ImportError as error:
+                    raise RuntimeError(f"terminal panel requires Qt WebEngine: {error}") from error
+                return asyncio.run(run_terminal_panel(args.port or 8768))
+            return asyncio.run(_run_panel(args.port or defaults.stdout, args.encoding))
         if args.action == "input":
             if "\n".encode(args.encoding) != b"\n":
                 input_parser.error("--encoding must use a single LF byte for newlines")
