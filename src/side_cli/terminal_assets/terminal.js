@@ -33,7 +33,7 @@ new QWebChannel(qt.webChannelTransport, ({ objects: { bridge } }) => {
   bridge.clipboard_text.connect(text => terminal.paste(text));
   bridge.output.connect(encoded => {
     const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
-    terminal.write(bytes, () => bridge.acknowledge_output());
+    terminal.write(bytes, () => bridge.acknowledge_output(terminal.modes.bracketedPasteMode));
   });
   terminal.open(element);
   layout.fit();

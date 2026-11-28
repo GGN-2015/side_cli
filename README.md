@@ -36,6 +36,8 @@ in the output so it can be copied.
 On the right, **Send** echoes the text immediately. Uncheck **Append newline**
 to add text to the pending line without writing to the child yet. Send a
 newline to deliver the full line, including the newline, to the child.
+**End of File** sends any buffered fragments without adding a newline, then
+closes the child's stdin for both the GUI and TCP. Output remains visible.
 The TCP panel shows each bound address, listening state, and active connection
 count. The window keeps the output visible after the command exits. Closing
 the window stops a command that is still running. GUI mode requires Tkinter
@@ -58,10 +60,26 @@ uv run side-cli run --gui -- codex
 uv run side-cli run --gui --terminal -- codex resume
 ```
 
-Type directly in the terminal area. Arrow keys, `Ctrl+C`, and full-screen
-terminal rendering work there. Use `Ctrl+Shift+C` to copy selected text and
-`Ctrl+Shift+V` to paste. The status bar shows the process and TCP listeners;
-closing the window stops the child. The embedded terminal requires a Windows
+The terminal, line entry, and TCP input stay active together and control the
+same process:
+
+- In the left-hand terminal, keystrokes are sent immediately. Arrow keys,
+  `Ctrl+C`, and full-screen rendering work there. Use `Ctrl+Shift+C` to copy
+  selected text and `Ctrl+Shift+V` to paste.
+- On the right, type in **Standard input** and press **Send** or Enter to
+  submit a line. Uncheck **Append newline** to buffer fragments without sending
+  them. Check it again and press **Send** to submit the entire line followed by
+  terminal Enter (`\r`), even if the entry field is empty.
+- **End of File** sends `Ctrl+D` on Linux or `Ctrl+Z` followed by Enter on
+  Windows. It doesn't submit the GUI draft or close the terminal or TCP
+  listeners. The child interprets the shortcut; in a line-oriented terminal,
+  use it when the child's input line is empty to signal EOF.
+- The **TCP ports** panel shows bound addresses, listener state, and client
+  counts. **Input activity** shows a local preview of buffered or queued lines
+  and forwarded TCP input without inserting that preview into the terminal or
+  the TCP output stream. The status bar shows the process state and exit code.
+
+Closing the window stops the child. The embedded terminal requires a Windows
 or Linux desktop session and the Qt WebEngine system libraries on Linux.
 Plain `--gui` with a non-terminal command still opens the Tk log window.
 

@@ -84,8 +84,10 @@ class Window:
         self.send_button = ttk.Button(input_panel, text="Send", command=self.submit, state=tk.DISABLED)
         self.send_button.grid(row=0, column=1)
         ttk.Checkbutton(input_panel, text="Append newline", variable=self.add_newline).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(8, 0)
+            row=1, column=0, sticky="w", pady=(8, 0)
         )
+        self.eof_button = ttk.Button(input_panel, text="End of File", command=self.submit_eof, state=tk.DISABLED)
+        self.eof_button.grid(row=1, column=1, sticky="e", pady=(8, 0))
         ttk.Label(input_panel, textvariable=self.input_status, wraplength=245).grid(
             row=2, column=0, columnspan=2, sticky="w"
         )
@@ -174,9 +176,9 @@ class Window:
             value = f"{address}\n{state} | {port.clients} {clients}"
             if self.port_values[port.stream].get() != value:
                 self.port_values[port.stream].set(value)
-        self.send_button.configure(
-            state=tk.NORMAL if self.supervisor.stdin_open and self.send_task is None else tk.DISABLED
-        )
+        input_state = tk.NORMAL if self.supervisor.stdin_open and self.send_task is None else tk.DISABLED
+        self.send_button.configure(state=input_state)
+        self.eof_button.configure(state=input_state)
 
     def submit(self, *_: object) -> str:
         if self.send_task is None and self.supervisor.stdin_open:
@@ -203,6 +205,22 @@ class Window:
             if self.entry.get() == text:
                 self.entry.delete(0, tk.END)
             self.input_status.set("Buffered until newline." if tail else "")
+        finally:
+            self.send_task = None
+
+    def submit_eof(self) -> None:
+        if self.send_task is None and self.supervisor.stdin_open:
+            self.send_task = asyncio.create_task(self.send_eof())
+
+    async def send_eof(self) -> None:
+        try:
+            final_data = self._input_encoder.encode(self._input_pending, final=True) if self._input_pending else b""
+            await self.supervisor.close_stdin(final_data=final_data)
+        except (OSError, ValueError) as error:
+            self.input_status.set(f"EOF failed: {error}")
+        else:
+            self._input_pending = ""
+            self.input_status.set("EOF sent. Standard input is closed.")
         finally:
             self.send_task = None
 

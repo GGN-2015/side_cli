@@ -22,6 +22,7 @@ CHUNK_SIZE = 64 * 1024
 CLIENT_BUFFER_LIMIT = 4 * 1024 * 1024
 INPUT_LINE_LIMIT = 1024 * 1024
 SHUTDOWN_TIMEOUT = 2.0
+_CONPTY_ENTER_DELAY = 0.2
 
 
 class Stream(StrEnum):
@@ -284,13 +285,30 @@ class Supervisor:
             writer.write(data)
             await writer.drain()
 
-    async def close_stdin(self) -> None:
-        """Send EOF to the child after all preceding writes."""
+    async def send_terminal_line(self, data: bytes) -> None:
+        """Submit text and Enter as one input, pacing the Enter key on ConPTY."""
+        async with self._stdin_lock:
+            if self._terminal is None or not self.stdin_open:
+                raise BrokenPipeError("child terminal is not open")
+            if os.name == "nt" and data:
+                await self._terminal.write(data)
+                await asyncio.sleep(_CONPTY_ENTER_DELAY)
+                data = b""
+            await self._terminal.write(data + b"\r")
+
+    async def close_stdin(self, *, final_data: bytes = b"") -> None:
+        """Write optional final bytes and send EOF after all preceding writes."""
         if self._terminal_size is not None:
             raise RuntimeError("terminal input cannot be closed independently of terminal output")
         async with self._stdin_lock:
-            if self._process is not None and self._process.stdin is not None:
-                self._process.stdin.close()
+            writer = self._process.stdin if self._process is not None else None
+            if writer is None or writer.is_closing():
+                if final_data:
+                    raise BrokenPipeError("child stdin is not open")
+                return
+            if final_data:
+                writer.write(final_data)
+            writer.close()
 
     def resize_terminal(self, columns: int, rows: int) -> None:
         """Resize a running terminal, or set its initial size before launch."""
@@ -423,12 +441,6 @@ class Supervisor:
             writer.close()
 
     async def _serve_input(self, reader: asyncio.StreamReader) -> None:
-        if self._terminal_size is not None:
-            while data := await reader.read(CHUNK_SIZE):
-                await self._started.wait()
-                await self.send(data)
-            return
-        lines = _InputLines()
         decoder = self._input_decoder("replace") if self._input_decoder is not None else None
 
         async def echo(data: bytes, *, final: bool = False) -> None:
@@ -438,6 +450,15 @@ class Supervisor:
                     if inspect.isawaitable(result):
                         await result
 
+        if self._terminal_size is not None:
+            while data := await reader.read(CHUNK_SIZE):
+                await self._started.wait()
+                await self.send(data)
+                await echo(data)
+            await echo(b"", final=True)
+            return
+
+        lines = _InputLines()
         while data := await reader.read(CHUNK_SIZE):
             await echo(data)
             for line in lines.feed(data):
